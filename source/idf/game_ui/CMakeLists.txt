@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "game_ui.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        ad_keys
+        lvgl
+        lvgl_port
+        freertos
+        esp_timer
+)

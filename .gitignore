@@ -1,4 +1,5 @@
 build/
+build.pre_target.*/
 sdkconfig
 sdkconfig.old
 managed_components/

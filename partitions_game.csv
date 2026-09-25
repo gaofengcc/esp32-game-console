@@ -1,0 +1,7 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# 单 factory 固件布局：合并包最高只覆盖 app 实际长度，NVS 位于 app 之后。
+# 不放置 otadata，P1 不使用 OTA 双分区。
+factory,  app,  factory, 0x10000,  0x4F0000,
+nvs,      data, nvs,     0x500000, 0x6000,
+phy_init, data, phy,     0x506000, 0x1000,
+storage,  data, spiffs,  0x510000, 0xAF0000,

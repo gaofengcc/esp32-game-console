@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "lvgl_port.c"
+        "lv_font_cjk.c"
+        "nas_ui_dashboard.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        lvgl
+        LCD35
+        board
+        esp_timer
+        freertos
+        nvs_flash
+)

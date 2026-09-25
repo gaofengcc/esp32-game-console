@@ -1,0 +1,4 @@
+version: "1.0.0"
+description: "ESP32-S3 ADC1 single-channel five-key resistor ladder driver"
+targets:
+  - esp32s3
