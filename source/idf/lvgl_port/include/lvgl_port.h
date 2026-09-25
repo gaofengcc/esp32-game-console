@@ -83,6 +83,8 @@ esp_err_t lvgl_port_deferred_create_main_screen(void);
  * Generated from SimHei (can be replaced with Source Han Sans / WenQuanYi).
  */
 extern const lv_font_t lv_font_cjk_16;
+extern const lv_font_t lv_font_cjk_20;
+extern const lv_font_t lv_font_cjk_28;
 
 #define FONT_CJK (&lv_font_cjk_16)
 

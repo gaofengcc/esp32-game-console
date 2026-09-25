@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "game_ui.c"
+        "game_ui_port_esp.c"
         "../../game/snake_logic.c"
     INCLUDE_DIRS
         "include"
@@ -11,4 +12,5 @@ idf_component_register(
         lvgl_port
         freertos
         esp_timer
+        nvs_flash
 )

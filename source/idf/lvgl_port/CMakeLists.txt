@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "lvgl_port.c"
         "lv_font_cjk.c"
+        "lv_font_cjk_ui.c"
         "game_home.c"
     INCLUDE_DIRS
         "include"

@@ -75,3 +75,44 @@
 - 尚未烧录或连接真实设备，触摸校准、AD 阈值和实际 LCD 局部刷新吞吐仍需后续台架验证。
 - PC 模拟器使用软件 framebuffer 截图，设备端仍通过 LCD35 驱动输出。
 - 若后续修改棋盘宏或格子像素，需要同时保证棋盘尺寸与 `480x320` 屏幕匹配。
+
+## P2 关键缺口修复（2026-09-26）
+
+### 本次改动
+
+- `source/idf/game_ui/include/game_ui_port.h` 收敛日志、NVS 最高分、LVGL 调度、触摸校准、周期任务和 `ad_keys_event_t` 回调入口。
+- `source/idf/game_ui/game_ui_port_esp.c` 转发到 `esp_log`、NVS、`lvgl_port_call`、FreeRTOS 和 `ad_keys_set_event_callback`。
+- `simulator/sim_port.c/.h` 提供本地最高分文件、printf 日志、直接 LVGL 调用、无头时间推进和按键注入。
+- `simulator/CMakeLists.txt` 共编译真实设备 UI：`../source/idf/game_ui/game_ui.c`、`sim_port.c`、`../source/game/snake_logic.c`、`lv_font_cjk.c`、`lv_font_cjk_ui.c`。
+- `game_ui.c` 不含 `SIMULATOR` 分支；模拟器和设备渲染同一份 UI。本地 Source Han Sans SC 子集生成真实 `lv_font_cjk_20`/`lv_font_cjk_28`，正文/标题不做像素缩放。
+- 修复按钮 label 更新对象错误，并加入背景、边框、按下状态反馈。
+
+### 布局取舍
+
+- 顶部新增独立 32px 状态栏，棋盘移到 `y=32`，尺寸为 `480x288`，即 `30x18` 格、每格 16px。
+- 代价是从原 `30x20` 减少 2 行棋盘；这是为避免状态栏遮挡棋子、保证 480x320 像素对齐做的可玩性取舍，后续如确认必须保留 20 行需重新讨论屏幕布局。
+
+### 验证证据
+
+- 模拟器可执行文件：
+  - `/home/gaofeng/code/esp32-game-console/simulator/build/snake_sim`
+  - `/home/gaofeng/code/esp32-game-console/simulator/build/snake_test`
+- `SDL_VIDEODRIVER=dummy ./simulator/build/snake_test`：
+  `PASS menu_visible`、`PASS menu_to_start`、`PASS pause`、`PASS resume`、`PASS force_food`、`PASS eat_food_score`、`PASS self_collision_game_over`、`PASS retry`、`PASS end_to_menu`。
+- `nm -C simulator/build/snake_sim | grep game_ui` 可见 `game_ui_init`、`game_ui_update`、`game_ui_render_menu/game/game_end` 及 `game_ui_port_*` 符号，证明真实 UI 已进入链接。
+- 五张 480x320 截图：
+  - `/home/gaofeng/code/esp32-game-console/output/sim/p2_01_menu.png`：首页菜单、28px 标题、20px 按钮/正文和可见按钮样式。
+  - `/home/gaofeng/code/esp32-game-console/output/sim/p2_02_game.png`：游戏进行中，顶部状态栏与 30x18 棋盘分离。
+  - `/home/gaofeng/code/esp32-game-console/output/sim/p2_03_ate.png`：吃到食物后分数显示 10。
+  - `/home/gaofeng/code/esp32-game-console/output/sim/p2_04_paused.png`：暂停提示 `已暂停 K5继续`。
+  - `/home/gaofeng/code/esp32-game-console/output/sim/p2_05_end.png`：结束页、分数/最高分和两个可见按钮。
+- 固件构建：`IDF_PATH=/home/gaofeng/esp/esp-idf-v5.3.5 ./build_esp32.sh` 通过。
+  - `/home/gaofeng/code/esp32-game-console/output/esp32_game_console.bin`：688128 bytes，SHA256 `4dabfb507051e7047024ccc571b5da181d956af3b07a4b786809d015aec88eac`
+  - `/home/gaofeng/code/esp32-game-console/output/esp32_game_console_merged.bin`：753664 bytes，SHA256 `7bf3a84ff97caa826252e55ba3516373c6868c05f68b917d8ce4ed798468c600`
+  - merged 仅含 bootloader、partition-table、factory app，无 `otadata`，大小远小于 NVS 起始地址 `0x500000`。
+
+### 遗留风险
+
+- 未烧录、未接 Win10 串口桥，LCD 实机刷新、触摸校准和 AD 电压阈值仍未做硬件验证。
+- UI 字库是本地 Source Han Sans SC 的文案子集；后续新增中文文案必须同步扩展字库生成脚本/资源。
+- `game_ui_force_food`、`game_ui_force_self_collision` 是仿真/冒烟测试辅助接口，若后续要收紧设备公共 API，可迁移到独立测试适配层。
