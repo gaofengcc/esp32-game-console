@@ -45,3 +45,33 @@
 - merged 包不应在 app 二进制异常膨胀到 `0x500000` 以上时发布；脚本会直接失败。
 - 本分区表为单 factory 方案，后续若引入 OTA 必须重新设计分区和发布流程，不能直接恢复旧的 `otadata` 合并逻辑。
 - codex 本次执行被 2400s 超时终止（exit 124），代码与构建已完成，收尾（提交、文档哈希更正）由 Hermes 接管。
+
+## P2 贪吃蛇交接摘要（2026-09-26）
+
+### 做了什么
+
+- 新增纯 C 逻辑层 `source/game/snake_logic.c/.h`：30x20 棋盘、方向/暂停输入、反向忽略、吃食物计分、每 5 个食物提速 10ms（最低 100ms）、穿墙开关、撞墙/撞自己结束、暂停和确定性食物生成。
+- 最高分采用函数指针存储抽象：设备端 `game_ui.c` 使用 NVS namespace `game` / key `high_score`；PC 模拟器使用本地文件。
+- 重写 `source/idf/game_ui/game_ui.c` 为菜单、游戏、暂停、结束页；游戏中只消费按键事件，LVGL 更新通过 `lvgl_port_call()` 在 LVGL 任务上下文执行；棋盘格状态只更新变化格子。
+- 清理 `lvgl_port` 的 NAS 遗留入口，改为 `game_home_create()`，同步更新 CMake 和头文件。
+- 新增 `simulator/` CMake 工程，使用本地复制的 LVGL 9.5.0、SDL2 和共享逻辑；支持 `--scene menu|game|end`、`--keys`、`--steps`、`--shot`、`--selftest`，`SDL_VIDEODRIVER=dummy` 可无头运行。
+
+### 实测证据
+
+- 逻辑层：`cc -std=c11 -Wall -Wextra -Werror -Isource/game -c source/game/snake_logic.c` 通过。
+- 模拟器：`cmake -S simulator -B simulator/build ... && cmake --build simulator/build -j2` 通过。
+- `SDL_VIDEODRIVER=dummy simulator/build/snake_sim --selftest` 全部 PASS：前进、反向输入、强制食物、吃食物计分、每 5 个提速、暂停、穿墙开/关、撞自己、最高分写入/读取。
+- 截图：
+  - `/home/gaofeng/code/esp32-game-console/output/sim/menu.png`
+  - `/home/gaofeng/code/esp32-game-console/output/sim/game.png`
+  - `/home/gaofeng/code/esp32-game-console/output/sim/end.png`
+- 固件：`./build_esp32.sh` 通过，且 merged 包仍不含 `otadata`，大小小于 NVS 起始地址 `0x500000`。
+- 本轮固件产物：
+  - `/home/gaofeng/code/esp32-game-console/output/esp32_game_console.bin`：671712 bytes，SHA256 `d5f6e0d8e8fa117c48b3a066c6ffe17402abfa3c53b0b427f2b7b16b8c85db7e`
+  - `/home/gaofeng/code/esp32-game-console/output/esp32_game_console_merged.bin`：737248 bytes，SHA256 `8474b8ca7205c08795804a50891b81a9aa2ab05a061dd4493e1cb6a3eda1bb17`
+
+### 遗留风险与下一步
+
+- 尚未烧录或连接真实设备，触摸校准、AD 阈值和实际 LCD 局部刷新吞吐仍需后续台架验证。
+- PC 模拟器使用软件 framebuffer 截图，设备端仍通过 LCD35 驱动输出。
+- 若后续修改棋盘宏或格子像素，需要同时保证棋盘尺寸与 `480x320` 屏幕匹配。

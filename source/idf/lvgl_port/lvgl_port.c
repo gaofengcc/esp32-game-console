@@ -831,7 +831,7 @@ esp_err_t lvgl_port_deferred_create_main_screen(void)
         return ESP_ERR_NO_MEM;
     }
 
-    s_deferred_ui_init = nas_ui_create_dashboard;
+    s_deferred_ui_init = game_home_create;
 
     /* Wait for the LVGL handler task to complete the init (max 30s) */
     if (xSemaphoreTake(s_ui_done_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {

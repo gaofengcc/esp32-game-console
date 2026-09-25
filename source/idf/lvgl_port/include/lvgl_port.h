@@ -69,7 +69,7 @@ bool lvgl_port_touch_calibration_valid(void);
 /**
  * @brief Request the LVGL handler task to create the main screen
  *
- * Schedules nas_ui_create_dashboard() to run in the LVGL handler
+ * Schedules game_home_create() to run in the LVGL handler
  * task context. Returns when screen creation is complete.
  *
  * @return ESP_OK on success, ESP_FAIL on timeout or error
@@ -89,11 +89,11 @@ extern const lv_font_t lv_font_cjk_16;
 /**
  * @brief 创建最小首页。
  */
-void nas_ui_create_dashboard(void);
+void game_home_create(void);
 
 /**
  * @brief 兼容旧调用方的空更新接口。
  */
-void nas_ui_update_data(const void *data);
+void game_home_update_data(const void *data);
 
 #endif /* LVGL_PORT_H */

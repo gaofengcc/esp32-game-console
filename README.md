@@ -1,13 +1,39 @@
-# ESP32-S3 游戏机 P1 固件
+# ESP32-S3 贪吃蛇游戏机
 
-本工程面向 `ESP32-S3 N16R8`，P1 交付范围为：
+本工程面向 `ESP32-S3 N16R8`，当前交付范围为：
 
 - ILI9488 横屏显示：`480x320`，SPI 40 MHz。
 - XPT2046 电阻触摸：软件 SPI，保留校准流程。
 - GPIO1（ADC1_CH0）单路 AD 五键：单键识别、自动标定、NVS 持久化、短按/长按/连发事件。
-- LVGL v9 按键测试页和标定页。
+- LVGL v9 贪吃蛇菜单、游戏、暂停和结束页。
+- PC 端 LVGL 9.5 + SDL2 无头模拟器，可脚本注入按键并导出 PNG/BMP。
 
-本阶段不包含游戏逻辑、WiFi、OTA、`diag_service`，也不执行任何烧录或实机操作。
+本阶段不包含重力感应、WiFi、OTA、`diag_service`，也不执行任何烧录或实机操作。
+
+## 贪吃蛇架构
+
+- `source/game/` 是纯 C 逻辑层，不依赖 ESP-IDF 或 LVGL；设备端和 PC 端共用。
+- `source/idf/game_ui/game_ui.c` 只负责 LVGL 渲染、按键队列和页面切换。
+- 最高分通过 `snake_config_t` 的 `load_best/save_best` 函数指针抽象：设备端接 NVS namespace `game`、key `high_score`，PC 端接本地文件。
+- 默认棋盘为 `30x20`、每格 `16px`；默认慢速 `260ms/格`、默认穿墙。每吃 5 个食物速度减少 `10ms`，最低 `100ms/格`。
+- 实体键映射宏位于 `source/idf/game_ui/game_ui.c`：`GAME_UI_KEY_UP/DOWN/LEFT/RIGHT/PAUSE`，默认对应 K1/K2/K3/K4/K5。
+- 修改棋盘大小：调整 `source/game/snake_logic.h` 中的 `SNAKE_BOARD_WIDTH/HEIGHT`；修改格子像素：调整 `GAME_UI_CELL_PX`，并确保总尺寸仍为 `480x320`。
+
+## PC 模拟器
+
+LVGL 9.5.0 源码从本地参考工程复制到 `simulator/third_party/lvgl`，不联网下载。构建和运行：
+
+```bash
+cmake -S simulator -B simulator/build \
+  -DCONFIG_LV_BUILD_DEMOS=OFF \
+  -DCONFIG_LV_BUILD_EXAMPLES=OFF
+cmake --build simulator/build -j2
+SDL_VIDEODRIVER=dummy simulator/build/snake_sim --selftest
+SDL_VIDEODRIVER=dummy simulator/build/snake_sim \
+  --scene game --keys "K3,K3,K2" --steps 6 --shot output/sim/game.png
+```
+
+`--scene menu|game|end` 可生成首页、进行中和结束页截图；`--shot` 使用 `.png` 时写 PNG，其他扩展名写 BMP。模拟器支持无头运行，不需要显示器。
 
 ## 环境与构建
 

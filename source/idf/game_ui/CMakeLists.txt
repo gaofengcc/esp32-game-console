@@ -1,8 +1,10 @@
 idf_component_register(
     SRCS
         "game_ui.c"
+        "../../game/snake_logic.c"
     INCLUDE_DIRS
         "include"
+        "../../game"
     REQUIRES
         ad_keys
         lvgl

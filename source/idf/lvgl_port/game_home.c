@@ -1,15 +1,12 @@
 /**
- * @file nas_ui_dashboard.c
- * @brief LVGL 端口最小首页（保留兼容入口，去除 NAS 业务依赖）。
- *
- * P1 主应用可直接调用 nas_ui_create_dashboard() 创建空首页，
- * 后续按键测试页在 LVGL 任务上下文中增量构建。
+ * @file game_home.c
+ * @brief 游戏机最小首页入口。
  */
 
 #include "lvgl_port.h"
 #include "lvgl.h"
 
-void nas_ui_create_dashboard(void)
+void game_home_create(void)
 {
     lv_obj_t *screen = lv_screen_active();
     if (screen == NULL) {
@@ -27,9 +24,7 @@ void nas_ui_create_dashboard(void)
     lv_obj_center(title);
 }
 
-/* 兼容旧版调用方；P1 默认不需要外部 NAS 数据更新。 */
-void nas_ui_update_data(const void *data)
+void game_home_update_data(const void *data)
 {
     (void)data;
 }
-

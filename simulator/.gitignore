@@ -1,0 +1,4 @@
+build/
+.snake_score
+.snake_test_score
+third_party/lvgl/

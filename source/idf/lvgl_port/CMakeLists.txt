@@ -2,7 +2,7 @@ idf_component_register(
     SRCS
         "lvgl_port.c"
         "lv_font_cjk.c"
-        "nas_ui_dashboard.c"
+        "game_home.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

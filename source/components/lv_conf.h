@@ -1,6 +1,6 @@
 /**
  * @file lv_conf.h
- * @brief LVGL v9.5.0 configuration for ESP32-S3 Nas-assistant project
+ * @brief LVGL v9.5.0 configuration for ESP32-S3 游戏机项目
  * 
  * Display: ILI9488 横屏 480x320 RGB565
  * Touch: XPT2046

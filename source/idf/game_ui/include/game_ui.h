@@ -6,7 +6,7 @@
 extern "C" {
 #endif
 
-/* 初始化按键测试页和 UI 刷新任务。 */
+/* 初始化贪吃蛇菜单、游戏页和 UI 刷新任务。 */
 esp_err_t game_ui_init(void);
 
 #ifdef __cplusplus
