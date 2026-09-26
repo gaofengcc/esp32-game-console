@@ -152,11 +152,14 @@ void game_select_ui_render(void *user_data)
  * @brief 处理选择页方向键和确认键.
  *
  * @param key 实体键编号, 与 GAME_UI_KEY_* 对应.
- * @param type 按下或连发. 确认键只响应 PRESS.
+ * @param type 只响应 PRESS. 选择页不吃连发, 避免按住时连跳.
  * @return 无.
  */
 void game_select_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
 {
+    if (type != AD_KEYS_EVENT_PRESS) {
+        return;
+    }
     if (key == GAME_UI_KEY_UP || key == GAME_UI_KEY_LEFT) {
         game_ui_move_index(&s_select_index, GAME_SELECT_ITEM_COUNT, -1);
         game_ui_request_render();
@@ -168,9 +171,6 @@ void game_select_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
         game_ui_port_log_i(TAG, "选择页下一项 index=%u",
                            (unsigned)s_select_index);
     } else if (key == GAME_UI_KEY_PAUSE) {
-        if (type != AD_KEYS_EVENT_PRESS) {
-            return;
-        }
         game_select_activate();
     }
 }

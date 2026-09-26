@@ -1300,19 +1300,15 @@ void maze_ui_render(void *user_data)
  * @brief 处理实体键: 菜单导航, 暂停选项或对局移动.
  *
  * @param key 实体键编号, 与 GAME_UI_KEY_* 对应.
- * @param type 按下或连发. 确认键只响应 PRESS.
- * @return 无.
- */
-/**
- * @brief 处理实体键: 菜单导航, 暂停选项或对局移动.
- *
- * @param key 实体键编号, 与 GAME_UI_KEY_* 对应.
- * @param type 按下或连发. 确认键只响应 PRESS.
+ * @param type 菜单和暂停弹窗只响应 PRESS. 对局里方向键仍接受连发.
  * @return 无.
  */
 void maze_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
 {
     if (s_page == MAZE_UI_PAGE_MENU) {
+        if (type != AD_KEYS_EVENT_PRESS) {
+            return;
+        }
         if (key == GAME_UI_KEY_UP || key == GAME_UI_KEY_LEFT) {
             game_ui_move_index(&s_maze_menu_index, GAME_UI_MAZE_MENU_ITEM_COUNT,
                                -1);
@@ -1322,15 +1318,15 @@ void maze_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
                                1);
             game_ui_request_render();
         } else if (key == GAME_UI_KEY_PAUSE) {
-            if (type != AD_KEYS_EVENT_PRESS) {
-                return;
-            }
             maze_ui_activate_menu();
         }
         return;
     }
 
     if (maze_game_get_status(&s_maze) == MAZE_STATUS_PAUSED) {
+        if (type != AD_KEYS_EVENT_PRESS) {
+            return;
+        }
         if (key == GAME_UI_KEY_UP || key == GAME_UI_KEY_LEFT) {
             game_ui_move_index(&s_maze_pause_index,
                                GAME_UI_MAZE_PAUSE_ITEM_COUNT, -1);
@@ -1339,7 +1335,7 @@ void maze_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
             game_ui_move_index(&s_maze_pause_index,
                                GAME_UI_MAZE_PAUSE_ITEM_COUNT, 1);
             game_ui_request_render();
-        } else if (key == GAME_UI_KEY_PAUSE && type == AD_KEYS_EVENT_PRESS) {
+        } else if (key == GAME_UI_KEY_PAUSE) {
             maze_ui_activate_pause();
         }
         return;

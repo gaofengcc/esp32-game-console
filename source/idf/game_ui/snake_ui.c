@@ -46,7 +46,7 @@
 
 #define GAME_UI_MENU_ITEM_COUNT 5U
 #define GAME_UI_END_ITEM_COUNT 2U
-#define GAME_UI_PAUSE_ITEM_COUNT 2U
+#define GAME_UI_PAUSE_ITEM_COUNT 3U
 
 typedef enum {
     SNAKE_UI_PAGE_MENU = 0,
@@ -473,7 +473,7 @@ static void snake_ui_menu_back_clicked(lv_event_t *event)
 }
 
 /**
- * @brief 确认暂停弹窗: 继续或重新开始.
+ * @brief 确认暂停弹窗: 继续, 再来一次或返回设置.
  *
  * @return 无.
  */
@@ -483,6 +483,17 @@ static void snake_ui_activate_pause(void)
     if (s_pause_index == 1U) {
         game_ui_port_log_i(TAG, "暂停后重新开始");
         snake_ui_retry_game();
+        return;
+    }
+    if (s_pause_index == 2U) {
+        /* 先退出逻辑暂停态, 避免后台残留暂停标记影响下次开局渲染. */
+        if (snake_game_get_status(&s_game) == SNAKE_STATUS_PAUSED) {
+            snake_game_set_input(&s_game, SNAKE_INPUT_PAUSE);
+        }
+        s_menu_index = 0U;
+        s_page = SNAKE_UI_PAGE_MENU;
+        game_ui_request_render();
+        game_ui_port_log_i(TAG, "暂停后返回设置");
         return;
     }
     if (snake_game_get_status(&s_game) == SNAKE_STATUS_PAUSED) {
@@ -519,6 +530,23 @@ static void snake_ui_pause_retry_clicked(lv_event_t *event)
     s_pause_index = 1U;
     snake_ui_activate_pause();
     snake_ui_render_game(NULL);
+    (void)game_ui_consume_render();
+}
+
+/**
+ * @brief 触摸点击暂停弹窗"返回", 回到贪吃蛇设置页.
+ *
+ * @param event LVGL 点击事件, 本函数不使用内容.
+ * @return 无.
+ */
+static void snake_ui_pause_back_clicked(lv_event_t *event)
+{
+    (void)event;
+    s_pause_index = 2U;
+    snake_ui_activate_pause();
+    if (s_page == SNAKE_UI_PAGE_MENU) {
+        snake_ui_render_menu(NULL);
+    }
     (void)game_ui_consume_render();
 }
 
@@ -808,8 +836,8 @@ static void snake_ui_create_game(void)
 
     /* 暂停面板只覆盖局部, 避免整屏半透明导致蛇身每次位移都全屏重绘. */
     s_pause_overlay = lv_obj_create(s_game_screen);
-    lv_obj_set_pos(s_pause_overlay, 100, 56);
-    lv_obj_set_size(s_pause_overlay, 280, 168);
+    lv_obj_set_pos(s_pause_overlay, 100, 48);
+    lv_obj_set_size(s_pause_overlay, 280, 220);
     lv_obj_set_scrollbar_mode(s_pause_overlay, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_flex_flow(s_pause_overlay, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(s_pause_overlay, 10, LV_PART_MAIN);
@@ -842,6 +870,11 @@ static void snake_ui_create_game(void)
         lv_obj_set_width(s_pause_buttons[1], lv_pct(100));
         lv_obj_set_height(s_pause_buttons[1], 40);
         lv_obj_add_event_cb(s_pause_buttons[1], snake_ui_pause_retry_clicked,
+                            LV_EVENT_CLICKED, NULL);
+        s_pause_buttons[2] = game_ui_make_button(s_pause_overlay, "返回", NULL);
+        lv_obj_set_width(s_pause_buttons[2], lv_pct(100));
+        lv_obj_set_height(s_pause_buttons[2], 40);
+        lv_obj_add_event_cb(s_pause_buttons[2], snake_ui_pause_back_clicked,
                             LV_EVENT_CLICKED, NULL);
     }
     s_pause_index = 0U;
@@ -1543,12 +1576,15 @@ void snake_ui_render(void *user_data)
  * @brief 处理实体键: 菜单, 结束页, 暂停或对局转向.
  *
  * @param key 实体键编号, 与 GAME_UI_KEY_* 对应.
- * @param type 按下或连发. 确认键只响应 PRESS.
+ * @param type 菜单, 结束页和暂停弹窗只响应 PRESS. 对局里方向键仍接受连发.
  * @return 无.
  */
 void snake_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
 {
     if (s_page == SNAKE_UI_PAGE_MENU) {
+        if (type != AD_KEYS_EVENT_PRESS) {
+            return;
+        }
         if (key == GAME_UI_KEY_UP || key == GAME_UI_KEY_LEFT) {
             game_ui_move_index(&s_menu_index, GAME_UI_MENU_ITEM_COUNT, -1);
             game_ui_request_render();
@@ -1556,14 +1592,14 @@ void snake_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
             game_ui_move_index(&s_menu_index, GAME_UI_MENU_ITEM_COUNT, 1);
             game_ui_request_render();
         } else if (key == GAME_UI_KEY_PAUSE) {
-            if (type != AD_KEYS_EVENT_PRESS) {
-                return;
-            }
             snake_ui_activate_menu();
         }
         return;
     }
     if (s_page == SNAKE_UI_PAGE_END) {
+        if (type != AD_KEYS_EVENT_PRESS) {
+            return;
+        }
         if (key == GAME_UI_KEY_UP || key == GAME_UI_KEY_LEFT) {
             game_ui_move_index(&s_end_index, GAME_UI_END_ITEM_COUNT, -1);
             game_ui_request_render();
@@ -1571,9 +1607,6 @@ void snake_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
             game_ui_move_index(&s_end_index, GAME_UI_END_ITEM_COUNT, 1);
             game_ui_request_render();
         } else if (key == GAME_UI_KEY_PAUSE) {
-            if (type != AD_KEYS_EVENT_PRESS) {
-                return;
-            }
             if (s_end_index == 1U) {
                 s_menu_index = 0U;
                 s_page = SNAKE_UI_PAGE_MENU;
@@ -1586,13 +1619,16 @@ void snake_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
         return;
     }
     if (snake_game_get_status(&s_game) == SNAKE_STATUS_PAUSED) {
+        if (type != AD_KEYS_EVENT_PRESS) {
+            return;
+        }
         if (key == GAME_UI_KEY_UP || key == GAME_UI_KEY_LEFT) {
             game_ui_move_index(&s_pause_index, GAME_UI_PAUSE_ITEM_COUNT, -1);
             game_ui_request_render();
         } else if (key == GAME_UI_KEY_DOWN || key == GAME_UI_KEY_RIGHT) {
             game_ui_move_index(&s_pause_index, GAME_UI_PAUSE_ITEM_COUNT, 1);
             game_ui_request_render();
-        } else if (key == GAME_UI_KEY_PAUSE && type == AD_KEYS_EVENT_PRESS) {
+        } else if (key == GAME_UI_KEY_PAUSE) {
             snake_ui_activate_pause();
         }
         return;
