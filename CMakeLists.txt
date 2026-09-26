@@ -10,7 +10,6 @@ list(APPEND EXTRA_COMPONENT_DIRS
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-
 project(esp32_game_console)
 
 # esp32-lab-bridge v0.2.0 的 lvgl_screenshot 在条件 Kconfig 分支中声明
