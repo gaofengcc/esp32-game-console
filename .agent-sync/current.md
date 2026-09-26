@@ -208,3 +208,50 @@
   - `/home/gaofeng/code/esp32-game-console/output/bootloader.bin`：21568 bytes，SHA256 `17a72d10a871ec289b456e2c51d237123c7eb65e9afe2d2ba94ae43e9579a784`
   - `/home/gaofeng/code/esp32-game-console/output/partition-table.bin`：3072 bytes，SHA256 `258033a541f09c71f12b0456b6083f5ee86efd340c1d0211a369eb708c863935`
 - 未烧录、未调用 Win10 串口桥，未修改 `Nas-assistant`、`esp32-lab-bridge` 或 `LCD_Drivers`。
+
+## P8 验收（Hermes 补记，2026-09-26 14:20）
+
+> codex 本轮跑到 2700s 上限被系统杀掉（exit 124），未及写交接，本节由 Hermes 实测补记。
+
+### 提交（7 笔，分笔落实）
+```
+4c3ae24 feat: add wiggle amplitude comparison assets
+fa86977 fix: prefer psram for screenshots
+0a9d20a fix: close screenshot work item race
+31cd5f6 close snake tail connection seam
+59bcc55 fix snake seam evidence path
+603f02d fix snake seam-free segment assets
+063ce84 fix: screenshot thread safety
+```
+
+### 1) 截图线程安全修复（Hermes 实测通过）
+- 新增 `lvgl_port_capture_bmp(uint8_t **, size_t *, uint32_t timeout_ms)`（`lvgl_port.h:73` / `lvgl_port.c:1101`）
+- 机制：当前任务 == LVGL 任务 → **直接执行**（避免自投递死锁）；否则 `lvgl_port_call_internal()` 投递 + 超时 + cleanup 回调
+- `main.c:195` 改为调用新接口（timeout 1500ms）；**原先那句虚假注释已删除**
+- 截图缓冲区优先 PSRAM（`fa86977`）
+- ⚠️ **缺口：P8 任务书要求的"新增截图自测"未交付**（simulator 自测仍为 22 项，无 BMP 校验项）。即"跨任务投递路径"目前只有代码审查证据，**无自动化验证**。真机首次验证时请优先测 `/api/screenshot.bmp`。
+
+### 2) 蛇身节间细缝修复
+- 体节图左右不留描边，相邻节无缝；尾部衔接一并处理（`31cd5f6`）
+- 证据：`output/sim/snake_seam_zoom.png`（放大 4 倍拼接特写，Hermes 目视确认无 1px 断裂）
+
+### 3) 扭动幅度三档实测数据（关键结论）
+| 振幅 | 平均重绘/帧 | 屏面积占比 |
+|---|---|---|
+| 2px | 8,252 px | 5.37% |
+| 3px | 8,272 px | 5.39% |
+| 4px | 8,296 px | 5.40% |
+
+**结论：振幅对重绘开销几乎无影响**（开销由 LVGL flush 分块 ~8192px 主导，不是蛇身尺寸决定）。
+40MHz SPI 下每帧 ≈16.6KB ≈ **3.3ms**，20Hz 扭动更新占空比 ≈6.6% → **选 4px 也完全安全**。
+→ 振幅选择**纯属观感问题，不是性能问题**。默认值仍为 2px，等用户选定后一行宏即可切换。
+
+### 构建（Hermes 自行重跑）
+```
+IDF_PATH=/home/gaofeng/esp/esp-idf-v5.3.5 ./build_esp32.sh   # 通过
+esp32_game_console.bin 1362544 bytes  sha256=625d816aa20862d650383855f5f5b7bc9e6f3d1a2751439a99bf7808c9e38e55
+partition-table.bin    3072 bytes     sha256=6bc0d8697425bf7d469976984c9a127f85b0b80983dd77fc27f47445756f9906
+bootloader.bin         21632 bytes    sha256=a66c6b2bc83778f4a61dc9e4ef8a008fc9352463d0dc8c5c72189a0fec10e123
+ota_data_initial.bin   8192 bytes     sha256=7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f
+```
+模拟器自测 22 项全 PASS（未破坏游戏逻辑）。
