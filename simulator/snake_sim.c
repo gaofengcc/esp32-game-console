@@ -309,16 +309,6 @@ static int bmp_content_valid(const uint8_t *bmp, size_t len)
     return !all_zero && !all_same;
 }
 
-static uint32_t bmp_hash(const uint8_t *bmp, size_t len)
-{
-    uint32_t hash = 2166136261U;
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= bmp[i];
-        hash *= 16777619U;
-    }
-    return hash;
-}
-
 static int selftest_shot(void)
 {
     int all = 1;
