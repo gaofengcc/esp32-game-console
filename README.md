@@ -7,15 +7,48 @@
 - GPIO1（ADC1_CH0）单路 AD 五键：单键识别、自动标定、NVS 持久化、短按/长按/连发事件。
 - LVGL v9 贪吃蛇菜单、游戏、暂停和结束页。
 - PC 端 LVGL 9.5 + SDL2 无头模拟器，可脚本注入按键并导出 PNG/BMP。
+- `esp32-lab-bridge v0.2.0` 的 `diag_service`、`ota_update`、`lvgl_screenshot`：
+  局域网状态/日志/截图/OTA/重启，Bearer 鉴权。
+- 编译期配置的 WiFi STA；拿到 IP 后自动启动诊断服务。
 
-本阶段不包含重力感应、WiFi、OTA、`diag_service`，也不执行任何烧录或实机操作。
+本阶段不包含重力感应；本次代码只做编译、模拟器和静态证据验证，不执行烧录或实机操作。
+
+## lab-bridge 导入
+
+`third_party/esp32-lab-bridge` 是固定到 tag `v0.2.0` 的 Git submodule，根
+`CMakeLists.txt` 只注册以下三个组件：
+
+- `wireless/diag_service`
+- `wireless/ota_update`
+- `firmware/lvgl_screenshot`
+
+没有导入 `log_gate`（它依赖 EasyLogger），也没有注册 `cdc_command`。正常联网环境下：
+
+```bash
+git submodule update --init --checkout
+git -C third_party/esp32-lab-bridge checkout v0.2.0
+```
+
+若在离线环境改用本地镜像，先把 `.gitmodules` 中的 URL 换成本地路径，再执行：
+
+```bash
+git submodule sync -- third_party/esp32-lab-bridge
+git submodule update --init --checkout
+```
+
+恢复远端 URL：
+
+```bash
+git submodule set-url third_party/esp32-lab-bridge \
+  https://github.com/gaofengcc/esp32-lab-bridge.git
+```
 
 ## 贪吃蛇架构
 
 - `source/game/` 是纯 C 逻辑层，不依赖 ESP-IDF 或 LVGL；设备端和 PC 端共用。
 - `source/idf/game_ui/game_ui.c` 只负责 LVGL 渲染、按键队列和页面切换。
 - 最高分通过 `snake_config_t` 的 `load_best/save_best` 函数指针抽象：设备端接 NVS namespace `game`、key `high_score`，PC 端接本地文件。
-- 默认棋盘为 `30x20`、每格 `16px`；默认慢速 `260ms/格`、默认穿墙。每吃 5 个食物速度减少 `10ms`，最低 `100ms/格`。
+- 默认棋盘为 `30x18`、每格 `16px`；默认慢速 `260ms/格`、默认穿墙。每吃 5 个食物速度减少 `10ms`，最低 `100ms/格`。
 - 实体键映射宏位于 `source/idf/game_ui/game_ui.c`：`GAME_UI_KEY_UP/DOWN/LEFT/RIGHT/PAUSE`，默认对应 K1/K2/K3/K4/K5。
 - 修改棋盘大小：调整 `source/game/snake_logic.h` 中的 `SNAKE_BOARD_WIDTH/HEIGHT`；修改格子像素：调整 `GAME_UI_CELL_PX`，并确保总尺寸仍为 `480x320`。
 
@@ -56,42 +89,80 @@ idf.py build
 
 1. 编译 bootloader、分区表和 `esp32_game_console.bin`。
 2. 将产物复制到 `output/`。
-3. 仅合并以下三个区间，生成不含 `otadata` 的单文件包：
-   - `0x0000`：bootloader
-   - `0x8000`：partition-table
-   - `0x10000`：factory app
-4. 输出每个 bin 的绝对路径、字节数和 SHA256，并写入 `output/manifest.json`。
+3. 输出 `bootloader.bin`、`partition-table.bin`、`ota_data_initial.bin`、
+   app bin、`flash_args` 和 `output/manifest.json`。
+4. 对每个产物输出绝对路径、字节数和 SHA256。
 
-脚本会拒绝发布覆盖到 NVS 起始地址 `0x500000` 的 merged bin。这样可以避免 `esptool merge_bin` 对未指定区间填充 `0xFF` 时擦除 NVS。**不要把 `otadata`、空白区间或旧的双 OTA 镜像加入合并命令。**
+### 重要：禁止 merged 整包烧录
+
+双 OTA 布局之后，脚本**停止生成整包 merged 固件**。
+
+- ✅ 正确烧录：`idf.py -p <PORT> flash`，或按 `output/flash_args` 中的地址分开写入。
+- ❌ 禁止把 merged 整包写到 `0x0`。未指定区间会被填成 `0xFF`，会擦掉
+  NVS/配网数据；这个坑曾在 Nas 工程中发生过。
+
+本任务不执行烧录，也不调用 Win10 串口桥。
 
 ## 分区
 
-`partitions_game.csv` 使用单 factory app：
+`partitions_game.csv` 使用 16MB 双 OTA 布局：
 
 | 分区 | 偏移 | 大小 | 用途 |
 |---|---:|---:|---|
-| `factory` | `0x10000` | `0x4F0000` | P1 固件 |
-| `nvs` | `0x500000` | `0x6000` | AD 按键标定、后续游戏存档 |
-| `phy_init` | `0x506000` | `0x1000` | PHY 初始化数据 |
-| `storage` | `0x510000` | `0xAF0000` | 后续资源/文件系统预留 |
+| `nvs` | `0x9000` | `0x6000` | AD 标定、最高分、WiFi/NVS 数据 |
+| `otadata` | `0xF000` | `0x2000` | 当前 OTA 启动槽 |
+| `phy_init` | `0x11000` | `0x1000` | PHY 初始化数据 |
+| `ota_0` | `0x20000` | `0x200000` | OTA app 槽 0 |
+| `ota_1` | `0x220000` | `0x200000` | OTA app 槽 1 |
+| `storage` | `0x420000` | `0xBE0000` | SPIFFS，后续存档/资源 |
 
-P1 不使用 `otadata`，也不使用 OTA 双 app 分区。NVS 放在 app 之后，且 merged 包最高地址受脚本保护。
+## WiFi 与诊断配置
 
-## 烧录命令（仅供后续阶段）
+`main/Kconfig.projbuild` 提供：
 
-本阶段禁止烧录。后续在确认硬件和串口后，可使用独立文件烧录：
+- `CONFIG_USER_WIFI_SSID`
+- `CONFIG_USER_WIFI_PASSWORD`
+- `CONFIG_GAME_CONSOLE_ENABLE_WIFI`
+- `CONFIG_GAME_CONSOLE_DIAG_PORT`
+- `CONFIG_GAME_CONSOLE_DIAG_TOKEN`
+
+STA 只使用编译期配置，不包含 NVS 配网流程；关闭
+`CONFIG_GAME_CONSOLE_ENABLE_WIFI` 时完全不初始化 WiFi。凭据和固定 token
+属于敏感信息，只能写被 gitignore 的 `sdkconfig` 或
+`sdkconfig.defaults.local`，禁止提交。token 留空时启动随机生成并打印到串口。
+
+WiFi 获得 IPv4 后才启动 `diag_service`。游戏 UI 不显示网络/调试信息，只保留串口日志。
+
+## 真机诊断路由速查
+
+下面令牌只作占位，真机启动时从串口日志复制实际 token：
 
 ```bash
-idf.py -p PORT flash
+IP=192.168.1.123
+PORT=8080
+TOKEN='replace-with-serial-token'
+AUTH=(-H "Authorization: Bearer ${TOKEN}")
+
+curl "http://${IP}:${PORT}/api/status" "${AUTH[@]}"
+curl "http://${IP}:${PORT}/api/logs" "${AUTH[@]}"
+curl -o screenshot.bmp "http://${IP}:${PORT}/api/screenshot.bmp" "${AUTH[@]}"
+curl "http://${IP}:${PORT}/api/ota/status" "${AUTH[@]}"
+curl -X POST "http://${IP}:${PORT}/api/ota/check?manifest_url=http://host/manifest.json" "${AUTH[@]}"
+curl -X POST "http://${IP}:${PORT}/api/ota/start?manifest_url=http://host/manifest.json" "${AUTH[@]}"
+curl -X POST "http://${IP}:${PORT}/api/reboot" "${AUTH[@]}"
 ```
 
-或者使用单文件包，从 `0x0` 开始：
+`/api/health` 不需要 Bearer 头；其余路由都需要
+`Authorization: Bearer <token>`。OTA manifest URL 也可放在 JSON body：
 
 ```bash
-python -m esptool --chip esp32s3 --port PORT write_flash 0x0 output/esp32_game_console_merged.bin
+curl -X POST "http://${IP}:${PORT}/api/ota/start" \
+  "${AUTH[@]}" -H 'Content-Type: application/json' \
+  -d '{"manifest_url":"http://host/manifest.json"}'
 ```
 
-不要调用 Win10 串口桥的 `/api/flash`、`/api/reboot`，不要访问 `192.168.100.12`。
+`/api/ota/check` 当前执行 URL/请求格式校验并回显 manifest URL；真正下载、校验、
+写入 OTA 槽由 `/api/ota/start` 调用 `ota_update` 完成。
 
 ## 引脚表
 
@@ -140,4 +211,4 @@ AD 输入必须使用 ADC1，衰减默认 12 dB（ESP-IDF v5.3.5 对应 11/12 dB
 ./build_esp32.sh
 ```
 
-当前已完成编译和发布包生成；最终产物的绝对路径、文件大小和 SHA256 记录在 `.agent-sync/current.md` 与 `output/manifest.json`。当前不做实机烧录。
+模拟器不会链接 `game_wifi`、`diag_service` 或 OTA 组件；它继续只编译游戏逻辑和 UI。
