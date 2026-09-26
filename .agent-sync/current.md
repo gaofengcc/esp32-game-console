@@ -358,6 +358,11 @@ source/idf/lvgl_port/CMakeLists.txt:
 
 - 截图自测提交：`976d6e0`
   `test: add shared BMP screenshot selftest`
+- 清理未使用测试辅助函数：`387eaed`
+  `chore: remove unused screenshot test helper`
+- 额外验证：`cc -std=c11 -Wall -Wextra -Werror
+  -Isource/idf/lvgl_port/include -c
+  source/idf/lvgl_port/lvgl_bmp_encoder.c` 通过。
 
 ### 固件构建
 
