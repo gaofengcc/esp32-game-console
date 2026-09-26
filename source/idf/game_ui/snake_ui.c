@@ -7,10 +7,12 @@
 #include "lvgl.h"
 #include "assets/snake_16x16.h"
 
+/* 部分工具链不默认暴露 M_PI，扭动动画只需要这个常量。 */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
+/* 0/1/2 对应三套苹果贴图，构建时可切换而无需改渲染逻辑。 */
 #ifndef GAME_UI_APPLE_STYLE
 #define GAME_UI_APPLE_STYLE 0
 #endif
@@ -28,6 +30,7 @@
 #error "GAME_UI_APPLE_STYLE must be 0 (A), 1 (B), or 2 (C)"
 #endif
 
+/* 蛇身轻微扭动是纯 UI 动效，与逻辑步进相互独立。 */
 #ifndef GAME_UI_WIGGLE_ENABLE
 #define GAME_UI_WIGGLE_ENABLE 1
 #endif
@@ -44,6 +47,7 @@
 #define GAME_UI_WIGGLE_SEGMENT_PHASE_DEG 42
 #endif
 
+/* 菜单：开始、速度、穿墙、触摸、返回。 */
 #define GAME_UI_MENU_ITEM_COUNT 5U
 #define GAME_UI_END_ITEM_COUNT 2U
 #define GAME_UI_PAUSE_ITEM_COUNT 3U
@@ -55,6 +59,7 @@ typedef enum {
 } snake_ui_page_t;
 
 static const char *TAG = "snake_ui";
+/* 逻辑状态只在 game_ui 任务访问；LVGL 对象只在 render 回调访问。 */
 static snake_game_t s_game;
 static snake_ui_page_t s_page;
 static game_ui_back_cb_t s_on_back;
@@ -90,13 +95,28 @@ static lv_obj_t *s_end_title;
 static lv_obj_t *s_end_score;
 static lv_obj_t *s_end_high_score;
 
+/* 设置页的当前选项，下一局开始时同步到逻辑层。 */
 static bool s_wrap_enabled = true;
 static bool s_touch_control_enabled = false;
 static uint8_t s_speed_level = 0;
+/* 以下缓存是最近一次已应用到 LVGL 的值，避免每个 20ms tick 重写标签。 */
 static int s_rendered_score = -1;
 static int s_rendered_best = -1;
 static int s_rendered_speed_ms = -1;
 static bool s_rendered_paused;
+
+/* LVGL v9 的 style/label setter 无旧值比较, 每次调用都会触发无效化重绘.
+ * 以下缓存记录已应用到对象上的值, 仅在值变化时才真正调用 setter. */
+static uint8_t s_menu_focus_shown = 0xFFU;   /* 菜单页已高亮的下标 */
+static uint8_t s_pause_focus_shown = 0xFFU;  /* 暂停弹窗已高亮的下标 */
+static uint8_t s_end_focus_shown = 0xFFU;    /* 结束页已高亮的下标 */
+static uint8_t s_menu_shown_speed = 0xFFU;   /* 菜单页已显示的速度档 */
+static int8_t s_menu_shown_wrap = -1;        /* 菜单页已显示的穿墙开关 */
+static int8_t s_menu_shown_touch = -1;       /* 菜单页已显示的触摸开关 */
+static int s_menu_shown_best = -1;           /* 菜单页已显示的最高分 */
+static int s_end_shown_reason = -1;          /* 结束页已显示的结束原因 */
+static int s_end_shown_score = -1;           /* 结束页已显示的本局得分 */
+static int s_end_shown_best = -1;            /* 结束页已显示的最高分 */
 static snake_point_t s_rendered_food = {UINT8_MAX, UINT8_MAX};
 static uint32_t s_wiggle_phase_ms;
 static uint32_t s_wiggle_elapsed_ms;
@@ -161,30 +181,38 @@ static snake_input_t snake_ui_input_from_key(uint8_t key)
 }
 
 /**
- * @brief 刷新设置页按钮选中态和 K5 提示.
+ * @brief 刷新设置页按钮选中态和确定键提示.
  *
  * @return 无.
  */
 static void snake_ui_refresh_menu_focus(void)
 {
-    uint8_t i;
+    uint8_t prev = s_menu_focus_shown;
 
-    for (i = 0U; i < GAME_UI_MENU_ITEM_COUNT; ++i) {
-        game_ui_set_button_focus(s_menu_buttons[i], i == s_menu_index);
+    if (prev == s_menu_index) {
+        return;
     }
+    /* 只刷新失焦和新聚焦两个按钮, 避免全量 style 写入触发整屏重绘. */
+    if (prev < GAME_UI_MENU_ITEM_COUNT && s_menu_buttons[prev]) {
+        game_ui_set_button_focus(s_menu_buttons[prev], false);
+    }
+    if (s_menu_buttons[s_menu_index]) {
+        game_ui_set_button_focus(s_menu_buttons[s_menu_index], true);
+    }
+    s_menu_focus_shown = s_menu_index;
     if (!s_menu_hint) {
         return;
     }
     if (s_menu_index == 1U) {
-        lv_label_set_text(s_menu_hint, "K5 : 速度");
+        lv_label_set_text(s_menu_hint, "确定 : 速度");
     } else if (s_menu_index == 2U) {
-        lv_label_set_text(s_menu_hint, "K5 : 穿墙");
+        lv_label_set_text(s_menu_hint, "确定 : 穿墙");
     } else if (s_menu_index == 3U) {
-        lv_label_set_text(s_menu_hint, "K5 : 触摸");
+        lv_label_set_text(s_menu_hint, "确定 : 触摸");
     } else if (s_menu_index == 4U) {
-        lv_label_set_text(s_menu_hint, "K5 : 返回");
+        lv_label_set_text(s_menu_hint, "确定 : 返回");
     } else {
-        lv_label_set_text(s_menu_hint, "K5 : 开始游戏");
+        lv_label_set_text(s_menu_hint, "确定 : 开始游戏");
     }
 }
 
@@ -195,11 +223,18 @@ static void snake_ui_refresh_menu_focus(void)
  */
 static void snake_ui_refresh_pause_focus(void)
 {
-    uint8_t i;
+    uint8_t prev = s_pause_focus_shown;
 
-    for (i = 0U; i < GAME_UI_PAUSE_ITEM_COUNT; ++i) {
-        game_ui_set_button_focus(s_pause_buttons[i], i == s_pause_index);
+    if (prev == s_pause_index) {
+        return;
     }
+    if (prev < GAME_UI_PAUSE_ITEM_COUNT && s_pause_buttons[prev]) {
+        game_ui_set_button_focus(s_pause_buttons[prev], false);
+    }
+    if (s_pause_buttons[s_pause_index]) {
+        game_ui_set_button_focus(s_pause_buttons[s_pause_index], true);
+    }
+    s_pause_focus_shown = s_pause_index;
 }
 
 /**
@@ -209,11 +244,18 @@ static void snake_ui_refresh_pause_focus(void)
  */
 static void snake_ui_refresh_end_focus(void)
 {
-    uint8_t i;
+    uint8_t prev = s_end_focus_shown;
 
-    for (i = 0U; i < GAME_UI_END_ITEM_COUNT; ++i) {
-        game_ui_set_button_focus(s_end_buttons[i], i == s_end_index);
+    if (prev == s_end_index) {
+        return;
     }
+    if (prev < GAME_UI_END_ITEM_COUNT && s_end_buttons[prev]) {
+        game_ui_set_button_focus(s_end_buttons[prev], false);
+    }
+    if (s_end_buttons[s_end_index]) {
+        game_ui_set_button_focus(s_end_buttons[s_end_index], true);
+    }
+    s_end_focus_shown = s_end_index;
 }
 
 /**
@@ -230,6 +272,48 @@ static const char *snake_ui_speed_name(void)
             return "快";
         default:
             return "慢";
+    }
+}
+
+/**
+ * @brief 把逻辑方向换成日志中的短名称.
+ *
+ * @param direction 当前方向.
+ * @return 静态字符串.
+ */
+static const char *snake_ui_direction_name(snake_direction_t direction)
+{
+    switch (direction) {
+        case SNAKE_DIRECTION_UP:
+            return "up";
+        case SNAKE_DIRECTION_DOWN:
+            return "down";
+        case SNAKE_DIRECTION_LEFT:
+            return "left";
+        case SNAKE_DIRECTION_RIGHT:
+        default:
+            return "right";
+    }
+}
+
+/**
+ * @brief 把结束原因换成日志中的短名称.
+ *
+ * @param reason 逻辑层结束原因.
+ * @return 静态字符串.
+ */
+static const char *snake_ui_over_reason_name(snake_game_over_reason_t reason)
+{
+    switch (reason) {
+        case SNAKE_GAME_OVER_SELF_COLLISION:
+            return "self";
+        case SNAKE_GAME_OVER_WALL:
+            return "wall";
+        case SNAKE_GAME_OVER_BOARD_FULL:
+            return "full";
+        case SNAKE_GAME_OVER_NONE:
+        default:
+            return "none";
     }
 }
 
@@ -297,13 +381,25 @@ static void snake_ui_reset_render_cache(void)
  */
 static void snake_ui_start_game(void)
 {
+    const snake_state_t *state;
+
     snake_game_set_wrap(&s_game, s_wrap_enabled);
     snake_game_set_speed_level(&s_game, s_speed_level);
     snake_game_reset(&s_game);
     s_page = SNAKE_UI_PAGE_GAME;
     snake_ui_reset_render_cache();
     game_ui_request_render();
-    game_ui_port_log_i(TAG, "进入游戏");
+    state = snake_game_state(&s_game);
+    game_ui_port_log_i(
+        TAG,
+        "进入游戏 speed_level=%u speed_ms=%u wrap=%u touch=%u "
+        "head=(%u,%u) food=(%u,%u)",
+        (unsigned)s_speed_level, state ? (unsigned)state->speed_ms : 0U,
+        s_wrap_enabled ? 1U : 0U, s_touch_control_enabled ? 1U : 0U,
+        state ? (unsigned)state->segments[0].x : 0U,
+        state ? (unsigned)state->segments[0].y : 0U,
+        state ? (unsigned)state->food.x : 0U,
+        state ? (unsigned)state->food.y : 0U);
 }
 
 /**
@@ -313,13 +409,22 @@ static void snake_ui_start_game(void)
  */
 static void snake_ui_retry_game(void)
 {
+    const snake_state_t *state;
+
     snake_game_set_wrap(&s_game, s_wrap_enabled);
     snake_game_set_speed_level(&s_game, s_speed_level);
     snake_game_reset(&s_game);
     s_page = SNAKE_UI_PAGE_GAME;
     snake_ui_reset_render_cache();
     game_ui_request_render();
-    game_ui_port_log_i(TAG, "再来一局");
+    state = snake_game_state(&s_game);
+    game_ui_port_log_i(TAG, "再来一局 speed_ms=%u wrap=%u head=(%u,%u) food=(%u,%u)",
+                       state ? (unsigned)state->speed_ms : 0U,
+                       s_wrap_enabled ? 1U : 0U,
+                       state ? (unsigned)state->segments[0].x : 0U,
+                       state ? (unsigned)state->segments[0].y : 0U,
+                       state ? (unsigned)state->food.x : 0U,
+                       state ? (unsigned)state->food.y : 0U);
 }
 
 /**
@@ -345,16 +450,20 @@ static void snake_ui_activate_menu(void)
         s_speed_level = (uint8_t)((s_speed_level + 1U) % 3U);
         snake_game_set_speed_level(&s_game, s_speed_level);
         game_ui_request_render();
-        game_ui_port_log_i(TAG, "菜单确认速度");
+        game_ui_port_log_i(TAG, "菜单确认速度 level=%u speed_ms=%u",
+                           (unsigned)s_speed_level,
+                           (unsigned)snake_game_get_speed_ms(&s_game));
     } else if (s_menu_index == 2U) {
         s_wrap_enabled = !s_wrap_enabled;
         snake_game_set_wrap(&s_game, s_wrap_enabled);
         game_ui_request_render();
-        game_ui_port_log_i(TAG, "菜单确认穿墙");
+        game_ui_port_log_i(TAG, "菜单确认穿墙 enabled=%u",
+                           s_wrap_enabled ? 1U : 0U);
     } else if (s_menu_index == 3U) {
         s_touch_control_enabled = !s_touch_control_enabled;
         game_ui_request_render();
-        game_ui_port_log_i(TAG, "菜单确认触摸");
+        game_ui_port_log_i(TAG, "菜单确认触摸 enabled=%u",
+                           s_touch_control_enabled ? 1U : 0U);
     } else if (s_menu_index == 4U) {
         snake_ui_goto_select();
     } else {
@@ -479,7 +588,9 @@ static void snake_ui_menu_back_clicked(lv_event_t *event)
  */
 static void snake_ui_activate_pause(void)
 {
-    game_ui_port_log_i(TAG, "暂停确认 index=%u", (unsigned)s_pause_index);
+    game_ui_port_log_i(TAG, "暂停确认 index=%u score=%d speed_ms=%u",
+                       (unsigned)s_pause_index, s_game.state.score,
+                       (unsigned)s_game.state.speed_ms);
     if (s_pause_index == 1U) {
         game_ui_port_log_i(TAG, "暂停后重新开始");
         snake_ui_retry_game();
@@ -585,6 +696,7 @@ snake_input_t snake_ui_map_touch(int32_t x, int32_t y)
 void snake_ui_set_touch_control(bool enabled)
 {
     s_touch_control_enabled = enabled;
+    game_ui_port_log_i(TAG, "触摸转向 enabled=%u", enabled ? 1U : 0U);
 }
 
 /**
@@ -686,7 +798,7 @@ static void snake_ui_create_menu(void)
     lv_obj_add_event_cb(s_menu_buttons[4], snake_ui_menu_back_clicked,
                         LV_EVENT_CLICKED, NULL);
 
-    s_menu_hint = game_ui_make_label(s_screen, "K5 : 开始游戏",
+    s_menu_hint = game_ui_make_label(s_screen, "确定 : 开始游戏",
                                      GAME_UI_COLOR_ACCENT, game_ui_font_body());
     lv_obj_set_width(s_menu_hint, lv_pct(100));
     lv_obj_set_style_text_align(s_menu_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -939,16 +1051,32 @@ static void snake_ui_render_menu(void *user_data)
     if (!s_screen) {
         snake_ui_create_menu();
     }
-    lv_label_set_text_fmt(s_menu_speed_label, "速度：%s", snake_ui_speed_name());
-    lv_label_set_text_fmt(s_menu_wrap_label, "穿墙：%s",
-                          s_wrap_enabled ? "开" : "关");
-    if (s_menu_touch_label) {
+    /* 标签值缓存: 仅在值变化时重写, 避免重复 set_text_fmt 触发无效化. */
+    if (s_menu_shown_speed != s_speed_level) {
+        lv_label_set_text_fmt(s_menu_speed_label, "速度：%s",
+                              snake_ui_speed_name());
+        s_menu_shown_speed = s_speed_level;
+    }
+    if (s_menu_shown_wrap != (int8_t)s_wrap_enabled) {
+        lv_label_set_text_fmt(s_menu_wrap_label, "穿墙：%s",
+                              s_wrap_enabled ? "开" : "关");
+        s_menu_shown_wrap = (int8_t)s_wrap_enabled;
+    }
+    if (s_menu_touch_label &&
+        s_menu_shown_touch != (int8_t)s_touch_control_enabled) {
         lv_label_set_text_fmt(s_menu_touch_label, "触摸：%s",
                               s_touch_control_enabled ? "开" : "关");
+        s_menu_shown_touch = (int8_t)s_touch_control_enabled;
     }
     state = snake_game_state(&s_game);
-    lv_label_set_text_fmt(s_menu_high_score, "最高分：%d",
-                          state ? state->best_score : 0);
+    {
+        int best = state ? state->best_score : 0;
+
+        if (s_menu_shown_best != best) {
+            lv_label_set_text_fmt(s_menu_high_score, "最高分：%d", best);
+            s_menu_shown_best = best;
+        }
+    }
     snake_ui_refresh_menu_focus();
     lv_screen_load(s_screen);
 }
@@ -1475,11 +1603,22 @@ static void snake_ui_render_end(void *user_data)
                 break;
         }
     }
-    lv_label_set_text(s_end_title, end_message);
-    lv_label_set_text_fmt(s_end_score, "本局得分：%d",
-                          state ? state->score : 0);
-    lv_label_set_text_fmt(s_end_high_score, "最高分：%d",
-                          state ? state->best_score : 0);
+    /* 结束页内容缓存: 原因/得分/最高分之一变化才重填, 焦点移动不再整页重写. */
+    {
+        int reason = state ? (int)state->game_over_reason : -1;
+        int score = state ? state->score : 0;
+        int best = state ? state->best_score : 0;
+
+        if (reason != s_end_shown_reason || score != s_end_shown_score ||
+            best != s_end_shown_best) {
+            lv_label_set_text(s_end_title, end_message);
+            lv_label_set_text_fmt(s_end_score, "本局得分：%d", score);
+            lv_label_set_text_fmt(s_end_high_score, "最高分：%d", best);
+            s_end_shown_reason = reason;
+            s_end_shown_score = score;
+            s_end_shown_best = best;
+        }
+    }
     snake_ui_refresh_end_focus();
     lv_screen_load(s_end_screen);
 }
@@ -1559,7 +1698,9 @@ void snake_ui_render(void *user_data)
         snake_game_get_status(&s_game) == SNAKE_STATUS_GAME_OVER) {
         s_page = SNAKE_UI_PAGE_END;
         s_end_index = 0U;
-        game_ui_port_log_i(TAG, "游戏结束");
+        game_ui_port_log_i(TAG, "进入结束页 reason=%s score=%d best=%d",
+                           snake_ui_over_reason_name(s_game.state.game_over_reason),
+                           s_game.state.score, s_game.state.best_score);
     }
     if (s_page == SNAKE_UI_PAGE_GAME) {
         snake_ui_render_game(user_data);
@@ -1661,6 +1802,8 @@ void snake_ui_advance(uint32_t elapsed_ms)
     snake_direction_t before_direction;
     const snake_state_t *after;
     snake_point_t after_head = {UINT8_MAX, UINT8_MAX};
+    snake_direction_t after_direction;
+    bool changed;
 
     if (s_page != SNAKE_UI_PAGE_GAME) {
         return;
@@ -1682,15 +1825,49 @@ void snake_ui_advance(uint32_t elapsed_ms)
     if (after && after->length > 0U) {
         after_head = after->segments[0];
     }
-    if (!snake_ui_same_point(before_head, after_head) ||
+    after_direction = snake_game_get_direction(&s_game);
+    changed = !snake_ui_same_point(before_head, after_head) ||
         before_food.x != (after ? after->food.x : UINT8_MAX) ||
         before_food.y != (after ? after->food.y : UINT8_MAX) ||
         before_length != (after ? after->length : 0U) ||
         before_score != (after ? after->score : 0) ||
         before_paused != (after ? after->paused : false) ||
         before_game_over != (after ? after->game_over : false) ||
-        before_direction != snake_game_get_direction(&s_game)) {
+        before_direction != after_direction;
+    if (changed) {
         game_ui_request_render();
+    }
+    /*
+     * 普通逐格移动不记录；只在方向、得分、暂停或终局等可诊断状态
+     * 变化时输出，避免 20ms 任务把串口刷满。
+     */
+    if (after && before_direction != after_direction) {
+        game_ui_port_log_i(TAG, "转向 direction=%s head=(%u,%u)",
+                           snake_ui_direction_name(after_direction),
+                           (unsigned)after_head.x, (unsigned)after_head.y);
+    }
+    if (after && before_score != after->score) {
+        game_ui_port_log_i(
+            TAG,
+            "吃到果子 score=%d length=%u speed_ms=%u foods=%lu "
+            "head=(%u,%u) next_food=(%u,%u)",
+            after->score, (unsigned)after->length, (unsigned)after->speed_ms,
+            (unsigned long)after->foods_eaten, (unsigned)after_head.x,
+            (unsigned)after_head.y, (unsigned)after->food.x,
+            (unsigned)after->food.y);
+    }
+    if (after && before_paused != after->paused) {
+        game_ui_port_log_i(TAG, "暂停状态 changed=%u score=%d head=(%u,%u)",
+                           after->paused ? 1U : 0U, after->score,
+                           (unsigned)after_head.x, (unsigned)after_head.y);
+    }
+    if (after && !before_game_over && after->game_over) {
+        game_ui_port_log_i(
+            TAG,
+            "游戏结束 reason=%s score=%d best=%d length=%u head=(%u,%u)",
+            snake_ui_over_reason_name(after->game_over_reason), after->score,
+            after->best_score, (unsigned)after->length,
+            (unsigned)after_head.x, (unsigned)after_head.y);
     }
     snake_ui_advance_wiggle(elapsed_ms);
 }
@@ -1753,7 +1930,11 @@ const snake_state_t *snake_ui_state(void)
  */
 bool snake_ui_force_food(snake_point_t food)
 {
-    return snake_game_force_food(&s_game, food);
+    bool ok = snake_game_force_food(&s_game, food);
+
+    game_ui_port_log_i(TAG, "测试放置食物 (%u,%u) result=%u",
+                       (unsigned)food.x, (unsigned)food.y, ok ? 1U : 0U);
+    return ok;
 }
 
 /**
@@ -1774,6 +1955,10 @@ void snake_ui_force_self_collision(void)
     s_game.state.paused = false;
     s_game.state.game_over = false;
     game_ui_request_render();
+    game_ui_port_log_i(TAG, "测试构造自撞 head=(%u,%u) length=%u",
+                       (unsigned)s_game.state.segments[0].x,
+                       (unsigned)s_game.state.segments[0].y,
+                       (unsigned)s_game.state.length);
 }
 
 /**

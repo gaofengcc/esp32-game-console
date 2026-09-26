@@ -3,12 +3,15 @@
 #include "game_ui_port.h"
 #include "lvgl.h"
 
+/* 设置页：开始、模式、风格、返回。 */
 #define GAME_UI_MAZE_MENU_ITEM_COUNT 4U
 #define GAME_UI_MAZE_PAUSE_ITEM_COUNT 3U
+/* 迷宫棋盘保持和逻辑层同样的 16px 网格。 */
 #define GAME_UI_MAZE_CELL_PX 16U
 #define GAME_UI_MAZE_BOARD_X 8
 #define GAME_UI_MAZE_BOARD_W ((int32_t)MAZE_WIDTH * (int32_t)GAME_UI_MAZE_CELL_PX)
 #define GAME_UI_MAZE_BOARD_H ((int32_t)MAZE_HEIGHT * (int32_t)GAME_UI_MAZE_CELL_PX)
+/* 下面几个周期只影响角色/出口动画，不改变逻辑时间。 */
 #define MAZE_UI_EXIT_PULSE_MS 560U
 #define MAZE_UI_EXIT_REFRESH_MS 70U
 #define MAZE_UI_PLAYER_BOB_MS 500U
@@ -36,6 +39,7 @@ typedef enum {
 } maze_ui_page_t;
 
 static const char *TAG = "maze_ui";
+/* 逻辑状态只在 game_ui 任务更新，LVGL 对象只在 render 回调访问。 */
 static maze_game_t s_maze;
 static maze_ui_page_t s_page;
 static game_ui_back_cb_t s_on_back;
@@ -47,6 +51,9 @@ static maze_dir_t s_player_dir;
 /* 同一次界面循环里, 同一方向只走一格. 只在 game_ui 任务读写. */
 static bool s_step_this_tick;
 static maze_input_t s_stepped_input;
+/* 撞墙日志按时间节流；按住方向键时不会每 20ms 刷一行。 */
+static uint32_t s_last_block_log_ms;
+static bool s_block_log_valid;
 
 static const maze_ui_palette_t s_palettes[MAZE_UI_THEME_COUNT] = {
     /* 沙漠: 木门 / 蓝衣探险者 / 紫袍守卫 */
@@ -146,8 +153,45 @@ static lv_obj_t *s_maze_pause_overlay;
 static lv_obj_t *s_maze_pause_buttons[GAME_UI_MAZE_PAUSE_ITEM_COUNT];
 static uint8_t s_maze_pause_index;
 
+/* LVGL v9 的 style/label setter 无旧值比较, 每次调用都会触发无效化重绘.
+ * 以下缓存记录已应用到对象上的值, 仅在值变化时才真正调用 setter. */
+static uint8_t s_maze_menu_focus_shown = 0xFFU;  /* 设置页已高亮的下标 */
+static uint8_t s_maze_pause_focus_shown = 0xFFU; /* 暂停弹窗已高亮的下标 */
+static int s_maze_menu_shown_mode = -1;         /* 设置页已显示的模式 */
+static int s_maze_menu_shown_theme = -1;        /* 设置页已显示的风格 */
+static const void *s_maze_pal_applied;          /* 已应用到对局页的调色板 */
+static unsigned s_maze_info_shown_level = 0xFFFFU;   /* 状态栏已显示关卡 */
+static uint32_t s_maze_info_shown_sec = 0xFFFFFFFFU; /* 状态栏已显示秒数 */
+static int s_maze_info_shown_mode = -1;              /* 状态栏已显示模式 */
+static int s_maze_info_shown_theme = -1;             /* 状态栏已显示风格 */
+
 static void maze_ui_render_menu(void *user_data);
 static void maze_ui_render_game(void *user_data);
+
+/**
+ * @brief 把方向/输入换成日志短名称.
+ *
+ * @param input 迷宫输入.
+ * @return 静态字符串.
+ */
+static const char *maze_ui_input_name(maze_input_t input)
+{
+    switch (input) {
+        case MAZE_INPUT_UP:
+            return "up";
+        case MAZE_INPUT_DOWN:
+            return "down";
+        case MAZE_INPUT_LEFT:
+            return "left";
+        case MAZE_INPUT_RIGHT:
+            return "right";
+        case MAZE_INPUT_PAUSE:
+            return "pause";
+        case MAZE_INPUT_NONE:
+        default:
+            return "none";
+    }
+}
 
 /**
  * @brief 把迷宫模式换成设置页/状态栏上的中文名.
@@ -555,28 +599,36 @@ static void maze_ui_draw_guard(lv_layer_t *layer, const lv_area_t *board,
 }
 
 /**
- * @brief 按当前下标刷新设置页按钮高亮, 并更新 K5 提示.
+ * @brief 按当前下标刷新设置页按钮高亮, 并更新确定键提示.
  *
  * @return 无.
  */
 static void maze_ui_refresh_menu_focus(void)
 {
-    uint8_t i;
+    uint8_t prev = s_maze_menu_focus_shown;
 
-    for (i = 0U; i < GAME_UI_MAZE_MENU_ITEM_COUNT; ++i) {
-        game_ui_set_button_focus(s_maze_menu_buttons[i], i == s_maze_menu_index);
+    if (prev == s_maze_menu_index) {
+        return;
     }
+    /* 只刷新失焦和新聚焦两个按钮, 避免全量 style 写入触发整屏重绘. */
+    if (prev < GAME_UI_MAZE_MENU_ITEM_COUNT && s_maze_menu_buttons[prev]) {
+        game_ui_set_button_focus(s_maze_menu_buttons[prev], false);
+    }
+    if (s_maze_menu_buttons[s_maze_menu_index]) {
+        game_ui_set_button_focus(s_maze_menu_buttons[s_maze_menu_index], true);
+    }
+    s_maze_menu_focus_shown = s_maze_menu_index;
     if (!s_maze_menu_hint) {
         return;
     }
     if (s_maze_menu_index == 1U) {
-        lv_label_set_text(s_maze_menu_hint, "K5 : 切换模式");
+        lv_label_set_text(s_maze_menu_hint, "确定 : 切换模式");
     } else if (s_maze_menu_index == 2U) {
-        lv_label_set_text(s_maze_menu_hint, "K5 : 切换风格");
+        lv_label_set_text(s_maze_menu_hint, "确定 : 切换风格");
     } else if (s_maze_menu_index == 3U) {
-        lv_label_set_text(s_maze_menu_hint, "K5 : 返回");
+        lv_label_set_text(s_maze_menu_hint, "确定 : 返回");
     } else {
-        lv_label_set_text(s_maze_menu_hint, "K5 : 开始游戏");
+        lv_label_set_text(s_maze_menu_hint, "确定 : 开始游戏");
     }
 }
 
@@ -587,12 +639,19 @@ static void maze_ui_refresh_menu_focus(void)
  */
 static void maze_ui_refresh_pause_focus(void)
 {
-    uint8_t i;
+    uint8_t prev = s_maze_pause_focus_shown;
 
-    for (i = 0U; i < GAME_UI_MAZE_PAUSE_ITEM_COUNT; ++i) {
-        game_ui_set_button_focus(s_maze_pause_buttons[i],
-                                 i == s_maze_pause_index);
+    if (prev == s_maze_pause_index) {
+        return;
     }
+    if (prev < GAME_UI_MAZE_PAUSE_ITEM_COUNT && s_maze_pause_buttons[prev]) {
+        game_ui_set_button_focus(s_maze_pause_buttons[prev], false);
+    }
+    if (s_maze_pause_buttons[s_maze_pause_index]) {
+        game_ui_set_button_focus(s_maze_pause_buttons[s_maze_pause_index],
+                                 true);
+    }
+    s_maze_pause_focus_shown = s_maze_pause_index;
 }
 
 /**
@@ -627,9 +686,12 @@ static void maze_ui_goto_select(void)
  */
 static void maze_ui_start_game(void)
 {
+    const maze_state_t *state;
+    uint32_t seed;
+
     maze_game_set_mode(&s_maze, maze_game_get_mode(&s_maze));
-    maze_game_seed(&s_maze, (s_shot_seed != 0U) ? s_shot_seed
-                                                : game_ui_port_tick_ms());
+    seed = (s_shot_seed != 0U) ? s_shot_seed : game_ui_port_tick_ms();
+    maze_game_seed(&s_maze, seed);
     maze_game_start(&s_maze);
     s_page = MAZE_UI_PAGE_GAME;
     s_maze_pause_index = 0U;
@@ -638,8 +700,24 @@ static void maze_ui_start_game(void)
     s_player_dir = MAZE_DIR_RIGHT;
     s_step_this_tick = false;
     s_stepped_input = MAZE_INPUT_NONE;
+    s_last_block_log_ms = 0U;
+    s_block_log_valid = false;
     game_ui_request_render();
-    game_ui_port_log_i(TAG, "进入迷宫");
+    state = maze_game_state(&s_maze);
+    game_ui_port_log_i(
+        TAG,
+        "进入迷宫 mode=%s theme=%s seed=%lu level=%u "
+        "entrance=(%u,%u) exit=(%u,%u) guard=%u guard_pos=(%u,%u)",
+        maze_ui_mode_name(state ? state->mode : MAZE_MODE_SIMPLE),
+        maze_ui_theme_name(s_theme), (unsigned long)seed,
+        state ? (unsigned)state->level : 0U,
+        state ? (unsigned)state->entrance.x : 0U,
+        state ? (unsigned)state->entrance.y : 0U,
+        state ? (unsigned)state->exit_cell.x : 0U,
+        state ? (unsigned)state->exit_cell.y : 0U,
+        (state && state->guard_active) ? 1U : 0U,
+        state ? (unsigned)state->guard.x : 0U,
+        state ? (unsigned)state->guard.y : 0U);
 }
 
 /**
@@ -660,7 +738,8 @@ static void maze_ui_cycle_mode(void)
     }
     maze_game_set_mode(&s_maze, mode);
     game_ui_request_render();
-    game_ui_port_log_i(TAG, "迷宫切换模式");
+    game_ui_port_log_i(TAG, "迷宫切换模式 mode=%s",
+                       maze_ui_mode_name(mode));
 }
 
 /**
@@ -672,7 +751,8 @@ static void maze_ui_cycle_theme(void)
 {
     s_theme = (maze_ui_theme_t)(((unsigned)s_theme + 1U) % MAZE_UI_THEME_COUNT);
     game_ui_request_render();
-    game_ui_port_log_i(TAG, "迷宫切换风格");
+    game_ui_port_log_i(TAG, "迷宫切换风格 theme=%s",
+                       maze_ui_theme_name(s_theme));
 }
 
 /**
@@ -697,6 +777,8 @@ static void maze_ui_pick_other_theme(void)
         pick++;
     }
     s_theme = (maze_ui_theme_t)pick;
+    game_ui_port_log_i(TAG, "迷宫自动换风格 theme=%s",
+                       maze_ui_theme_name(s_theme));
 }
 
 /**
@@ -724,8 +806,17 @@ static void maze_ui_activate_menu(void)
  */
 static void maze_ui_activate_pause(void)
 {
-    game_ui_port_log_i(TAG, "迷宫暂停确认 index=%u",
-                       (unsigned)s_maze_pause_index);
+    const maze_state_t *state = maze_game_state(&s_maze);
+
+    game_ui_port_log_i(TAG, "迷宫暂停确认 index=%u level=%u remain_ms=%lu "
+                       "player=(%u,%u) guard=(%u,%u)",
+                       (unsigned)s_maze_pause_index,
+                       state ? (unsigned)state->level : 0U,
+                       state ? (unsigned long)state->remain_ms : 0UL,
+                       state ? (unsigned)state->player.x : 0U,
+                       state ? (unsigned)state->player.y : 0U,
+                       state ? (unsigned)state->guard.x : 0U,
+                       state ? (unsigned)state->guard.y : 0U);
     if (s_maze_pause_index == 1U) {
         maze_ui_start_game();
         return;
@@ -946,7 +1037,7 @@ static void maze_ui_create_menu(void)
     lv_obj_add_event_cb(s_maze_menu_buttons[3], maze_ui_menu_back_clicked,
                         LV_EVENT_CLICKED, NULL);
 
-    s_maze_menu_hint = game_ui_make_label(s_maze_menu_screen, "K5 : 开始游戏",
+    s_maze_menu_hint = game_ui_make_label(s_maze_menu_screen, "确定 : 开始游戏",
                                           GAME_UI_COLOR_ACCENT,
                                           game_ui_font_body());
     lv_obj_set_width(s_maze_menu_hint, lv_pct(100));
@@ -1157,13 +1248,20 @@ static void maze_ui_render_menu(void *user_data)
     if (!s_maze_menu_screen) {
         maze_ui_create_menu();
     }
-    if (s_maze_mode_label) {
-        lv_label_set_text_fmt(s_maze_mode_label, "模式：%s",
-                              maze_ui_mode_name(maze_game_get_mode(&s_maze)));
+    /* 标签值缓存: 仅在值变化时重写, 避免重复 set_text_fmt 触发无效化. */
+    {
+        int mode = (int)maze_game_get_mode(&s_maze);
+
+        if (s_maze_mode_label && s_maze_menu_shown_mode != mode) {
+            lv_label_set_text_fmt(s_maze_mode_label, "模式：%s",
+                                  maze_ui_mode_name((maze_mode_t)mode));
+            s_maze_menu_shown_mode = mode;
+        }
     }
-    if (s_maze_theme_label) {
+    if (s_maze_theme_label && s_maze_menu_shown_theme != (int)s_theme) {
         lv_label_set_text_fmt(s_maze_theme_label, "风格：%s",
                               maze_ui_theme_name(s_theme));
+        s_maze_menu_shown_theme = (int)s_theme;
     }
     maze_ui_refresh_menu_focus();
     lv_screen_load(s_maze_menu_screen);
@@ -1187,36 +1285,57 @@ static void maze_ui_render_game(void *user_data)
     if (!state) {
         return;
     }
+    /* 调色板缓存: 主题不变时不重复写 style, 避免整屏无效化. */
     {
         const maze_ui_palette_t *pal = maze_ui_palette();
 
-        lv_obj_set_style_bg_color(s_maze_screen, lv_color_hex(pal->status_bg),
-                                  LV_PART_MAIN);
-        lv_obj_set_style_bg_color(s_maze_status, lv_color_hex(pal->status_bg),
-                                  LV_PART_MAIN);
-        lv_obj_set_style_bg_color(s_maze_board, lv_color_hex(pal->frame),
-                                  LV_PART_MAIN);
-        if (s_maze_info_label) {
-            lv_obj_set_style_text_color(s_maze_info_label,
-                                        lv_color_hex(pal->status_fg),
-                                        LV_PART_MAIN);
-        }
-        if (s_maze_pause_hint) {
-            lv_obj_set_style_text_color(s_maze_pause_hint,
-                                        lv_color_hex(pal->status_fg),
-                                        LV_PART_MAIN);
+        if (s_maze_pal_applied != (const void *)pal) {
+            lv_obj_set_style_bg_color(s_maze_screen,
+                                      lv_color_hex(pal->status_bg),
+                                      LV_PART_MAIN);
+            lv_obj_set_style_bg_color(s_maze_status,
+                                      lv_color_hex(pal->status_bg),
+                                      LV_PART_MAIN);
+            lv_obj_set_style_bg_color(s_maze_board, lv_color_hex(pal->frame),
+                                      LV_PART_MAIN);
+            if (s_maze_info_label) {
+                lv_obj_set_style_text_color(s_maze_info_label,
+                                            lv_color_hex(pal->status_fg),
+                                            LV_PART_MAIN);
+            }
+            if (s_maze_pause_hint) {
+                lv_obj_set_style_text_color(s_maze_pause_hint,
+                                            lv_color_hex(pal->status_fg),
+                                            LV_PART_MAIN);
+            }
+            s_maze_pal_applied = (const void *)pal;
         }
     }
-    if (state->mode == MAZE_MODE_TIMED) {
-        lv_label_set_text_fmt(s_maze_info_label, "第%u关  %us  %s",
-                              (unsigned)state->level,
-                              (unsigned)((state->remain_ms + 999U) / 1000U),
-                              maze_ui_theme_name(s_theme));
-    } else {
-        lv_label_set_text_fmt(s_maze_info_label, "第%u关  %s  %s",
-                              (unsigned)state->level,
-                              maze_ui_mode_name(state->mode),
-                              maze_ui_theme_name(s_theme));
+    /* 状态栏缓存: 关卡/秒数/模式/风格任一变化才重写标签. */
+    {
+        unsigned level = (unsigned)state->level;
+        uint32_t sec = (state->mode == MAZE_MODE_TIMED)
+                           ? (state->remain_ms + 999U) / 1000U
+                           : 0U;
+
+        if (level != s_maze_info_shown_level ||
+            sec != s_maze_info_shown_sec ||
+            (int)state->mode != s_maze_info_shown_mode ||
+            (int)s_theme != s_maze_info_shown_theme) {
+            if (state->mode == MAZE_MODE_TIMED) {
+                lv_label_set_text_fmt(s_maze_info_label, "第%u关  %us  %s",
+                                      level, (unsigned)sec,
+                                      maze_ui_theme_name(s_theme));
+            } else {
+                lv_label_set_text_fmt(s_maze_info_label, "第%u关  %s  %s",
+                                      level, maze_ui_mode_name(state->mode),
+                                      maze_ui_theme_name(s_theme));
+            }
+            s_maze_info_shown_level = level;
+            s_maze_info_shown_sec = sec;
+            s_maze_info_shown_mode = (int)state->mode;
+            s_maze_info_shown_theme = (int)s_theme;
+        }
     }
     paused = (maze_game_get_status(&s_maze) == MAZE_STATUS_PAUSED);
     if (paused) {
@@ -1224,8 +1343,9 @@ static void maze_ui_render_game(void *user_data)
         lv_obj_clear_flag(s_maze_pause_overlay, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(s_maze_pause_overlay, LV_OBJ_FLAG_HIDDEN);
+        /* 暂停时角色和迷宫静止, 无需重绘棋盘; 弹窗区域由 LVGL 自行合成. */
+        lv_obj_invalidate(s_maze_board);
     }
-    lv_obj_invalidate(s_maze_board);
     lv_screen_load(s_maze_screen);
 }
 
@@ -1401,15 +1521,49 @@ void maze_ui_handle_key(uint8_t key, ad_keys_event_type_t type)
         if (event != MAZE_EVENT_NONE || input == MAZE_INPUT_PAUSE) {
             game_ui_request_render();
         }
-        if (event == MAZE_EVENT_LEVEL_CLEAR) {
+        if (event == MAZE_EVENT_BLOCKED) {
+            uint32_t now = game_ui_port_tick_ms();
+
+            if (!s_block_log_valid || (now - s_last_block_log_ms) >= 500U) {
+                s_last_block_log_ms = now;
+                s_block_log_valid = true;
+                game_ui_port_log_i(TAG, "迷宫移动受阻 input=%s player=(%u,%u) "
+                                   "level=%u",
+                                   maze_ui_input_name(input),
+                                   before ? (unsigned)before->player.x : 0U,
+                                   before ? (unsigned)before->player.y : 0U,
+                                   before ? (unsigned)before->level : 0U);
+            }
+        } else if (event == MAZE_EVENT_LEVEL_CLEAR) {
             s_player_dir = MAZE_DIR_RIGHT;
             maze_ui_pick_other_theme();
-            game_ui_port_log_i(TAG, "迷宫过关, 进入第%u关, 风格%s",
-                               (unsigned)maze_game_state(&s_maze)->level,
-                               maze_ui_theme_name(s_theme));
+            {
+                const maze_state_t *next = maze_game_state(&s_maze);
+
+                game_ui_port_log_i(
+                    TAG,
+                    "迷宫过关 level=%u player=(%u,%u) next_exit=(%u,%u) "
+                    "theme=%s",
+                    next ? (unsigned)next->level : 0U,
+                    next ? (unsigned)next->player.x : 0U,
+                    next ? (unsigned)next->player.y : 0U,
+                    next ? (unsigned)next->exit_cell.x : 0U,
+                    next ? (unsigned)next->exit_cell.y : 0U,
+                    maze_ui_theme_name(s_theme));
+            }
         } else if (event == MAZE_EVENT_CAUGHT) {
             s_player_dir = MAZE_DIR_RIGHT;
-            game_ui_port_log_i(TAG, "迷宫被发现, 回到入口");
+            {
+                const maze_state_t *reset = maze_game_state(&s_maze);
+
+                game_ui_port_log_i(TAG, "迷宫被发现 caught=%lu player=(%u,%u) "
+                                   "guard=(%u,%u)",
+                                   reset ? (unsigned long)reset->caught_count : 0UL,
+                                   reset ? (unsigned)reset->player.x : 0U,
+                                   reset ? (unsigned)reset->player.y : 0U,
+                                   reset ? (unsigned)reset->guard.x : 0U,
+                                   reset ? (unsigned)reset->guard.y : 0U);
+            }
         }
     }
 }
@@ -1453,9 +1607,22 @@ void maze_ui_advance(uint32_t elapsed_ms)
     if (event != MAZE_EVENT_NONE) {
         game_ui_request_render();
         if (event == MAZE_EVENT_TIMEOUT) {
-            game_ui_port_log_i(TAG, "迷宫超时, 本关重来");
+            game_ui_port_log_i(TAG, "迷宫超时 level=%u timeout_count=%lu "
+                               "remain_ms=%lu player=(%u,%u)",
+                               after ? (unsigned)after->level : 0U,
+                               after ? (unsigned long)after->timeout_count : 0UL,
+                               after ? (unsigned long)after->remain_ms : 0UL,
+                               after ? (unsigned)after->player.x : 0U,
+                               after ? (unsigned)after->player.y : 0U);
         } else if (event == MAZE_EVENT_CAUGHT) {
-            game_ui_port_log_i(TAG, "迷宫被发现, 回到入口");
+            game_ui_port_log_i(TAG, "迷宫被发现 caught=%lu level=%u "
+                               "player=(%u,%u) guard=(%u,%u)",
+                               after ? (unsigned long)after->caught_count : 0UL,
+                               after ? (unsigned)after->level : 0U,
+                               after ? (unsigned)after->player.x : 0U,
+                               after ? (unsigned)after->player.y : 0U,
+                               after ? (unsigned)after->guard.x : 0U,
+                               after ? (unsigned)after->guard.y : 0U);
         }
     } else if (after &&
                (!maze_game_same_point(before_player, after->player) ||
@@ -1522,6 +1689,8 @@ void maze_ui_set_theme(maze_ui_theme_t theme)
     }
     s_theme = theme;
     game_ui_request_render();
+    game_ui_port_log_i(TAG, "设置迷宫风格 theme=%s",
+                       maze_ui_theme_name(s_theme));
 }
 
 /**
@@ -1543,4 +1712,6 @@ maze_ui_theme_t maze_ui_get_theme(void)
 void maze_ui_set_shot_seed(uint32_t seed)
 {
     s_shot_seed = seed;
+    game_ui_port_log_i(TAG, "设置迷宫种子 seed=%lu",
+                       (unsigned long)s_shot_seed);
 }
