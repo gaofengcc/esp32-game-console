@@ -56,12 +56,15 @@ static const uint16_t AD_KEYS_FACTORY_CENTER_MV[AD_KEYS_COUNT] = {
     2397U, /* K5 确定 */
 };
 #ifndef AD_KEYS_LOG_PERIOD_MS
+/* 普通 ADC 快照的最小间隔，避免 5ms 采样任务刷满串口。 */
 #define AD_KEYS_LOG_PERIOD_MS 250U
 #endif
 #ifndef AD_KEYS_LOG_DELTA_MV
+/* 电压变化达到该幅度才提前触发一次快照。 */
 #define AD_KEYS_LOG_DELTA_MV 100U
 #endif
 #ifndef AD_KEYS_LOG_HEARTBEAT_MS
+/* 长时间无按键变化时仍保留一条低频资源/状态心跳。 */
 #define AD_KEYS_LOG_HEARTBEAT_MS 30000U
 #endif
 
