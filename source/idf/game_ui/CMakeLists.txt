@@ -1,11 +1,19 @@
 idf_component_register(
     SRCS
         "game_ui.c"
+        "game_ui_common.c"
+        "game_select_ui.c"
+        "snake_ui.c"
+        "maze_ui.c"
         "game_ui_port_esp.c"
         "../../game/snake_logic.c"
+        "../../game/maze_logic.c"
+        "../../game/maze_gen.c"
     INCLUDE_DIRS
         "include"
         "../../game"
+    PRIV_INCLUDE_DIRS
+        "."
     REQUIRES
         ad_keys
         lvgl
