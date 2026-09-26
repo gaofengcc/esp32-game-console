@@ -4,8 +4,10 @@
 
 extern const lv_font_t lv_font_cjk_16;
 
+/* 拷贝 port 提供的字体并挂接 CJK fallback，避免修改只读字体对象。 */
 static lv_font_t s_body_font_with_fallback;
 static lv_font_t s_title_font_with_fallback;
+/* 跨 game_ui 任务和 LVGL 线程的一位重绘请求标记。 */
 static bool s_render_pending;
 
 /**
@@ -96,9 +98,15 @@ lv_obj_t *game_ui_make_button(lv_obj_t *parent, const char *text,
     lv_obj_set_style_bg_color(button, lv_color_hex(GAME_UI_COLOR_BUTTON),
                               LV_PART_MAIN);
     lv_obj_set_style_bg_opa(button, LV_OPA_COVER, LV_PART_MAIN);
+    /* 边框保持恒定, 聚焦态由 outline 表达: outline 不参与布局,
+       避免 flex 父容器因 border_width 变化而整体重排重绘. */
     lv_obj_set_style_border_width(button, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_color(button, lv_color_hex(GAME_UI_COLOR_ACCENT),
+    lv_obj_set_style_border_color(button,
+                                  lv_color_hex(GAME_UI_COLOR_BUTTON_IDLE),
                                   LV_PART_MAIN);
+    lv_obj_set_style_outline_color(button, lv_color_hex(GAME_UI_COLOR_ACCENT),
+                                   LV_PART_MAIN);
+    lv_obj_set_style_outline_pad(button, 1, LV_PART_MAIN);
     lv_obj_set_style_radius(button, 4, LV_PART_MAIN);
     lv_obj_set_style_bg_color(button, lv_color_hex(GAME_UI_COLOR_BUTTON_PRESSED),
                               LV_PART_MAIN | LV_STATE_PRESSED);
@@ -141,7 +149,10 @@ lv_obj_t *game_ui_make_rect(lv_obj_t *parent, int32_t x, int32_t y,
 }
 
 /**
- * @brief 设置按钮选中/未选中边框和底色.
+ * @brief 设置按钮选中/未选中高亮框和底色.
+ *
+ * 聚焦框用 outline 表达: outline 绘制在对象外侧且不参与布局,
+ * 切换时只无效化按钮自身区域, 不会触发 flex 父容器整体重排.
  *
  * @param button 目标按钮, 为空则忽略.
  * @param focused true 表示当前选中项.
@@ -152,11 +163,7 @@ void game_ui_set_button_focus(lv_obj_t *button, bool focused)
     if (!button) {
         return;
     }
-    lv_obj_set_style_border_width(button, focused ? 3 : 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(
-        button,
-        lv_color_hex(focused ? GAME_UI_COLOR_ACCENT : GAME_UI_COLOR_BUTTON_IDLE),
-        LV_PART_MAIN);
+    lv_obj_set_style_outline_width(button, focused ? 3 : 0, LV_PART_MAIN);
     lv_obj_set_style_bg_color(
         button,
         lv_color_hex(focused ? GAME_UI_COLOR_BUTTON_PRESSED
@@ -165,7 +172,7 @@ void game_ui_set_button_focus(lv_obj_t *button, bool focused)
 }
 
 /**
- * @brief 在环形菜单上移动选中下标.
+ * @brief 在菜单上移动选中下标, 到顶/到底后钳位停住, 不环绕.
  *
  * @param index 当前下标, 为空则忽略.
  * @param count 选项个数, 0 则忽略.
@@ -181,9 +188,9 @@ void game_ui_move_index(uint8_t *index, uint8_t count, int8_t delta)
     }
     next = (int32_t)(*index) + (int32_t)delta;
     if (next < 0) {
-        next = (int32_t)count - 1;
-    } else if (next >= (int32_t)count) {
         next = 0;
+    } else if (next >= (int32_t)count) {
+        next = (int32_t)count - 1;
     }
     *index = (uint8_t)next;
 }

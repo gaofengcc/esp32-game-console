@@ -15,13 +15,17 @@
 extern "C" {
 #endif
 
+/* game_ui 逻辑任务的目标周期；输入和游戏状态都在该周期内推进。 */
 #define GAME_UI_TICK_MS 20U
+/* 贪吃蛇/迷宫共用的逻辑格像素尺寸和顶部状态栏高度。 */
 #define GAME_UI_CELL_PX 16U
 #define GAME_UI_STATUS_BAR_PX 32U
+/* 当前 LCD/LVGL 逻辑分辨率。 */
 #define GAME_UI_SCREEN_W 480
 #define GAME_UI_SCREEN_H 320
-#define GAME_UI_KEY5_TEXT "K5"
+#define GAME_UI_KEY5_TEXT "确定"
 
+/* ADC 按键编号；允许板级头文件在编译时覆盖默认映射。 */
 #ifndef GAME_UI_KEY_UP
 #define GAME_UI_KEY_UP 2U
 #endif
@@ -38,6 +42,7 @@ extern "C" {
 #define GAME_UI_KEY_PAUSE 5U
 #endif
 
+/* 游戏 UI 统一调色板（RGB888），具体游戏可在此基础上扩展。 */
 #define GAME_UI_COLOR_BG 0x0F1720
 #define GAME_UI_COLOR_PANEL 0x17232B
 #define GAME_UI_COLOR_TEXT 0xE8F1F2
@@ -128,7 +133,7 @@ lv_obj_t *game_ui_make_rect(lv_obj_t *parent, int32_t x, int32_t y,
 void game_ui_set_button_focus(lv_obj_t *button, bool focused);
 
 /**
- * @brief 在环形菜单上移动选中下标.
+ * @brief 在菜单上移动选中下标, 到顶/到底后钳位停住, 不环绕.
  *
  * @param index 当前下标, 为空则忽略.
  * @param count 选项个数, 0 则忽略.
