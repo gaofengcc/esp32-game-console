@@ -199,7 +199,13 @@ def tail_inside(kind: str, x: int, y: int) -> Tuple[bool, float]:
         axis, lateral = 15.0 - px, py - 8.0
     else:
         axis, lateral = px, py - 8.0
-    if axis < 1.0 or axis > 14.8:
+    boundary_connection = (
+        (kind == "tail_right" and x == WIDTH - 1)
+        or (kind == "tail_left" and x == 0)
+        or (kind == "tail_up" and y == 0)
+        or (kind == "tail_down" and y == HEIGHT - 1)
+    )
+    if axis < 1.0 or (axis > 14.8 and not boundary_connection):
         return False, axis
     # 末端明显收窄，根部保持接近体节宽度。
     width = 1.4 + 4.8 * (axis / 14.0)
