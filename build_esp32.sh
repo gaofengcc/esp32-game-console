@@ -18,6 +18,7 @@ APP_NAME="${APP_NAME:-esp32_game_console}"
 APP_BIN="${APP_BIN:-${APP_NAME}.bin}"
 MERGED_BIN="${MERGED_BIN:-${APP_NAME}_merged.bin}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
+LOCAL_TOOLCHAIN_FILE="${LOCAL_TOOLCHAIN_FILE:-${PROJECT_DIR}/tools/toolchain-esp32s3.cmake}"
 
 case "${BUILD_DIR}" in
     /*) ;;
@@ -68,6 +69,10 @@ if [[ ! -f "${PROJECT_DIR}/partitions_game.csv" ]]; then
     echo -e "${RED}缺少 partitions_game.csv。${NC}" >&2
     exit 1
 fi
+if [[ ! -f "${LOCAL_TOOLCHAIN_FILE}" ]]; then
+    echo -e "${RED}缺少本地工具链入口：${LOCAL_TOOLCHAIN_FILE}${NC}" >&2
+    exit 1
+fi
 # 精简的 LVGL 组件包仍会在 CMake 中注册 examples/demos 的 include 路径；
 # 即使配置关闭示例，也需要目录存在才能通过 ESP-IDF v5.3.5 的路径校验。
 if [[ -d "${PROJECT_DIR}/managed_components/lvgl__lvgl" ]]; then
@@ -86,7 +91,8 @@ if [[ "${CLEAN:-0}" == "1" ]]; then
         rmdir "${PROJECT_DIR}/managed_components/lvgl__lvgl/examples" 2>/dev/null || true
         rmdir "${PROJECT_DIR}/managed_components/lvgl__lvgl/demos" 2>/dev/null || true
     fi
-    idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" fullclean || true
+    idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" \
+        -DCMAKE_TOOLCHAIN_FILE="${LOCAL_TOOLCHAIN_FILE}" fullclean || true
 fi
 
 if [[ ! -f "${SDKCONFIG}" ]] || ! grep -q "^CONFIG_IDF_TARGET=\"${IDF_TARGET}\"$" "${SDKCONFIG}"; then
@@ -96,11 +102,13 @@ if [[ ! -f "${SDKCONFIG}" ]] || ! grep -q "^CONFIG_IDF_TARGET=\"${IDF_TARGET}\"$
         rm -rf "${BUILD_DIR}"
     fi
     mkdir -p "${BUILD_DIR}"
-    idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" set-target "${IDF_TARGET}"
+    idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" \
+        -DCMAKE_TOOLCHAIN_FILE="${LOCAL_TOOLCHAIN_FILE}" set-target "${IDF_TARGET}"
 fi
 
 echo -e "${YELLOW}开始编译...${NC}"
-idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" build
+idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" \
+    -DCMAKE_TOOLCHAIN_FILE="${LOCAL_TOOLCHAIN_FILE}" build
 
 BOOTLOADER_BIN="${BUILD_DIR}/bootloader/bootloader.bin"
 PARTITION_BIN="${BUILD_DIR}/partition_table/partition-table.bin"

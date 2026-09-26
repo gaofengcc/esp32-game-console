@@ -8,3 +8,5 @@ output/
 *.bin
 .cache/
 .vscode/
+__pycache__/
+*.pyc

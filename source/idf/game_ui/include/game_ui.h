@@ -18,6 +18,11 @@ const snake_state_t *game_ui_get_state(void);
 bool game_ui_force_food(snake_point_t food);
 void game_ui_force_self_collision(void);
 
+/* 扭动动画的仿真/自测观测接口。 */
+uint32_t game_ui_get_wiggle_phase_ms(void);
+int16_t game_ui_get_wiggle_offset(uint16_t segment_index);
+uint16_t game_ui_get_wiggle_updated_objects(void);
+
 #ifdef __cplusplus
 }
 #endif

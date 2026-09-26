@@ -1,6 +1,7 @@
 #include <SDL2/SDL.h>
 #include <lvgl.h>
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +18,30 @@ static uint16_t fb[W * H];
 static lv_display_t *disp;
 static SDL_Window *win;
 static const char *shot_path;
+static int flush_stats_enabled;
+static int wiggle_stats_enabled;
+static uint64_t flush_count;
+static uint64_t flush_pixels;
+static uint32_t flush_max_area;
+
+static void reset_flush_stats(void)
+{
+    flush_count = 0;
+    flush_pixels = 0;
+    flush_max_area = 0;
+}
 
 static void flush_cb(lv_display_t *d, const lv_area_t *a, uint8_t *px)
 {
     (void)d;
     uint32_t w = (uint32_t)(a->x2 - a->x1 + 1);
     uint32_t h = (uint32_t)(a->y2 - a->y1 + 1);
+    uint32_t area = w * h;
+    ++flush_count;
+    flush_pixels += area;
+    if (area > flush_max_area) {
+        flush_max_area = area;
+    }
     const uint16_t *src = (const uint16_t *)px;
     for (uint32_t y = 0; y < h; y++) {
         memcpy(&fb[(a->y1 + y) * W + a->x1], src + y * w, w * 2);
@@ -402,6 +421,21 @@ static int selftest_ui(void)
     all &= check_item("menu_to_start",
                       state && !state->game_over && !state->paused);
 
+    uint32_t phase_before = game_ui_get_wiggle_phase_ms();
+    advance_ms(50U);
+    uint32_t phase_after = game_ui_get_wiggle_phase_ms();
+    all &= check_item("wiggle_phase_advances",
+                      phase_after != phase_before);
+    int offsets_ok = 1;
+    for (uint16_t i = 0; state && i < state->length; ++i) {
+        int16_t offset = game_ui_get_wiggle_offset(i);
+        if (offset < -2 || offset > 2) {
+            offsets_ok = 0;
+            break;
+        }
+    }
+    all &= check_item("wiggle_offset_bounded", offsets_ok);
+
     inject_token("K5");
     state = game_ui_get_state();
     all &= check_item("pause", state && state->paused);
@@ -478,6 +512,9 @@ static int run_scene(const char *scene, const char *keys, int steps,
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     }
     inject_keys(keys);
+    /* 场景准备会触发一次建屏全量刷新；统计只保留后续动画/步进刷新。 */
+    pump_lvgl();
+    reset_flush_stats();
     const snake_state_t *state = game_ui_get_state();
     uint32_t step_ms = advance_step_ms;
     if (!step_ms) {
@@ -512,6 +549,10 @@ int main(int argc, char **argv)
             advance_step_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "--shot") && i + 1 < argc) {
             shot_path = argv[++i];
+        } else if (!strcmp(argv[i], "--flush-stats")) {
+            flush_stats_enabled = 1;
+        } else if (!strcmp(argv[i], "--wiggle-stats")) {
+            wiggle_stats_enabled = 1;
         } else if (!strcmp(argv[i], "--scene") && i + 1 < argc) {
             scene = argv[++i];
         } else if (!strcmp(argv[i], "--score-file") && i + 1 < argc) {
@@ -537,6 +578,22 @@ int main(int argc, char **argv)
     }
     if (!rc && shot_path && write_png(shot_path) != 0) {
         rc = 1;
+    }
+    if (flush_stats_enabled) {
+        double percent = (double)flush_pixels * 100.0 / (double)(W * H);
+        printf(
+            "FLUSH_STATS count=%" PRIu64 " pixels=%" PRIu64
+            " percent=%.3f max_rect=%u\n",
+            flush_count, flush_pixels, percent, flush_max_area);
+    }
+    if (wiggle_stats_enabled) {
+        printf("WIGGLE_STATS phase_ms=%" PRIu32 " updated_objects=%u "
+               "offset_1=%d offset_2=%d offset_3=%d\n",
+               game_ui_get_wiggle_phase_ms(),
+               game_ui_get_wiggle_updated_objects(),
+               game_ui_get_wiggle_offset(1U),
+               game_ui_get_wiggle_offset(2U),
+               game_ui_get_wiggle_offset(3U));
     }
     if (win) {
         SDL_DestroyWindow(win);

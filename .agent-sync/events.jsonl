@@ -11,3 +11,10 @@
 {"ts": "2026-09-26 11:19:24", "kind": "verify", "actor": "hermes", "summary": "P4 验收通过：自测20项(逻辑11+UI9) hermes重跑全PASS；merged 755088B f71dfdb7；面板工程未被改", "evidence": {"commit": "b99ab4a"}}
 {"ts": "2026-09-26 11:19:24", "kind": "dispatch", "actor": "hermes", "summary": "P5 派发：食物改16x16像素苹果(lv_image)，出3个候选风格对比图供用户挑", "evidence": {}}
 {"ts": "2026-09-26 11:33:00", "kind": "task_end", "actor": "daemon", "summary": "codex 任务结束（开始于 2026-09-26 11:19:15）", "evidence": {"last_activity": null}}
+{"ts": "2026-09-26 11:33:22", "kind": "verify", "actor": "hermes", "summary": "P5 验收通过：20项自测 hermes 重跑全PASS；食物仅1个 lv_image 对象；merged 755696B c29b2af6；3候选对比图已产出", "evidence": {"commit": "f9546a3"}}
+{"ts": "2026-09-26 11:35:38", "kind": "dispatch", "actor": "hermes", "summary": "P6 派发：蛇身像素化 + 扭动动画(位移与扭动解耦, 静止时原地扭动) + 出多帧序列图与 GIF 证明动效", "evidence": {}}
+{"ts": "2026-09-26 11:36:00", "kind": "task_start", "actor": "daemon", "summary": "codex 任务开始（PID 891775）", "evidence": {"rollout": "/home/gaofeng/.codex/sessions/2026/09/26/rollout-2026-09-26T11-35-41-01a0dbc8-7269-77a3-8577-f4351831f210.jsonl"}}
+{"ts": "2026-09-26 11:43:08", "kind": "dispatch", "actor": "hermes", "summary": "lab-bridge v0.2.0 派发：合并 Nas 实战版与模板版两条线 + 组件发布态(CMakeLists/idf_component.yml/Kconfig/README) + 两种导入方式文档 + 自检脚本 + 打 tag", "evidence": {"repo": "esp32-lab-bridge"}}
+{"ts": "2026-09-26 11:52:11", "kind": "dispatch", "actor": "hermes", "summary": "Nas-assistant 派发：补 USER_WIFI_* 正规 Kconfig + NVS 无配置时用编译期凭据自动配网(防 NVS 擦除后反复配网) + 可选 sdkconfig.defaults.local 机制", "evidence": {"repo": "Nas-assistant"}}
+{"ts": "2026-09-26 12:21:06", "kind": "verify", "actor": "hermes", "summary": "lab-bridge v0.2.0 验收通过：merged-bin 偏移修复实测在位(OTA_UPDATE_MERGED_APP_OFFSET 0x10000)；5组件版本一致；无业务字符串/无凭据；已推送 GitHub master 3980d16 + tag v0.2.0", "evidence": {"repo": "esp32-lab-bridge", "tag": "v0.2.0", "commit": "3980d16"}}
+{"ts": "2026-09-26 12:21:06", "kind": "fix", "actor": "hermes", "summary": "抓到并修复：自检脚本 check_components.sh 依赖 rg 且 rg 缺失时业务字符串扫描假 PASS(codex 在其自带 rg 环境跑所以自报 0 失败)；已改 grep 回退+命令替换判定，重打 tag", "evidence": {}}

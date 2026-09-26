@@ -1,9 +1,15 @@
 #include "game_ui.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "game_ui_port.h"
 #include "lvgl.h"
+#include "assets/snake_16x16.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /* 默认使用 A 经典红苹果；编译时设为 1/2 可切换 B 卡通亮眼版/C 简洁版。 */
 #ifndef GAME_UI_APPLE_STYLE
@@ -30,6 +36,23 @@ extern const lv_font_t lv_font_cjk_16;
 #define GAME_UI_CELL_PX 16U
 #define GAME_UI_STATUS_BAR_PX 32U
 #define GAME_UI_BOARD_CELLS (SNAKE_BOARD_WIDTH * SNAKE_BOARD_HEIGHT)
+
+/* 扭动动画参数：默认 2px、50ms 更新一次，即 20Hz。 */
+#ifndef GAME_UI_WIGGLE_ENABLE
+#define GAME_UI_WIGGLE_ENABLE 1
+#endif
+#ifndef GAME_UI_WIGGLE_AMPLITUDE_PX
+#define GAME_UI_WIGGLE_AMPLITUDE_PX 2
+#endif
+#ifndef GAME_UI_WIGGLE_UPDATE_MS
+#define GAME_UI_WIGGLE_UPDATE_MS 50U
+#endif
+#ifndef GAME_UI_WIGGLE_CYCLE_MS
+#define GAME_UI_WIGGLE_CYCLE_MS 1200U
+#endif
+#ifndef GAME_UI_WIGGLE_SEGMENT_PHASE_DEG
+#define GAME_UI_WIGGLE_SEGMENT_PHASE_DEG 42
+#endif
 
 /* 实体键映射可通过编译选项覆盖。默认 K1 上、K2 下、K3 左、K4 右、K5 暂停。 */
 #ifndef GAME_UI_KEY_UP
@@ -98,8 +121,11 @@ static lv_obj_t *s_status_bar;
 static lv_obj_t *s_board;
 static lv_obj_t *s_cells[GAME_UI_BOARD_CELLS];
 static uint8_t s_cell_state[GAME_UI_BOARD_CELLS];
-static lv_obj_t *s_head_eye_a;
-static lv_obj_t *s_head_eye_b;
+static lv_obj_t *s_snake_images[SNAKE_MAX_SEGMENTS];
+static const lv_image_dsc_t *s_snake_sources[SNAKE_MAX_SEGMENTS];
+static int16_t s_snake_rendered_x[SNAKE_MAX_SEGMENTS];
+static int16_t s_snake_rendered_y[SNAKE_MAX_SEGMENTS];
+static uint16_t s_snake_image_count;
 static lv_obj_t *s_food_image;
 static lv_obj_t *s_score_label;
 static lv_obj_t *s_best_label;
@@ -117,9 +143,12 @@ static int s_rendered_score = -1;
 static int s_rendered_best_score = -1;
 static bool s_rendered_paused;
 static bool s_board_needs_full_refresh = true;
-static snake_point_t s_rendered_head = {UINT8_MAX, UINT8_MAX};
 static snake_point_t s_rendered_food = {UINT8_MAX, UINT8_MAX};
-static snake_direction_t s_rendered_direction = SNAKE_DIRECTION_RIGHT;
+static uint32_t s_wiggle_phase_ms;
+static uint32_t s_wiggle_elapsed_ms;
+static bool s_wiggle_dirty;
+static int16_t s_wiggle_offsets[SNAKE_MAX_SEGMENTS];
+static uint16_t s_wiggle_updated_objects;
 
 static void game_ui_prepare_fonts(void)
 {
@@ -242,6 +271,15 @@ static void game_ui_start_game(void)
     s_rendered_best_score = -1;
     s_rendered_paused = false;
     s_board_needs_full_refresh = true;
+    s_wiggle_phase_ms = 0;
+    s_wiggle_elapsed_ms = 0;
+    s_wiggle_dirty = true;
+    memset(s_wiggle_offsets, 0, sizeof(s_wiggle_offsets));
+    memset(s_snake_sources, 0, sizeof(s_snake_sources));
+    for (uint16_t i = 0; i < SNAKE_MAX_SEGMENTS; ++i) {
+        s_snake_rendered_x[i] = INT16_MIN;
+        s_snake_rendered_y[i] = INT16_MIN;
+    }
     s_render_pending = true;
 }
 
@@ -255,6 +293,15 @@ static void game_ui_retry_game(void)
     s_rendered_best_score = -1;
     s_rendered_paused = false;
     s_board_needs_full_refresh = true;
+    s_wiggle_phase_ms = 0;
+    s_wiggle_elapsed_ms = 0;
+    s_wiggle_dirty = true;
+    memset(s_wiggle_offsets, 0, sizeof(s_wiggle_offsets));
+    memset(s_snake_sources, 0, sizeof(s_snake_sources));
+    for (uint16_t i = 0; i < SNAKE_MAX_SEGMENTS; ++i) {
+        s_snake_rendered_x[i] = INT16_MIN;
+        s_snake_rendered_y[i] = INT16_MIN;
+    }
     s_render_pending = true;
 }
 
@@ -406,26 +453,30 @@ static void game_ui_create_game_screen(void)
         s_board, SNAKE_BOARD_WIDTH * GAME_UI_CELL_PX - 2, 0, 2,
         SNAKE_BOARD_HEIGHT * GAME_UI_CELL_PX, COLOR_ACCENT);
 
-    /* 蛇头眼睛、食物图像只在坐标/方向变化时更新，避免每帧重绘。 */
-    s_head_eye_a = game_ui_make_rect(s_board, 0, 0, 3, 3, COLOR_EYE);
-    s_head_eye_b = game_ui_make_rect(s_board, 0, 0, 3, 3, COLOR_EYE);
+    /* 蛇段图像按实际蛇长懒创建，避免 540 个隐藏对象耗尽 LVGL 内存池。 */
+    s_snake_image_count = 0;
     s_food_image = lv_image_create(s_board);
     lv_obj_remove_style_all(s_food_image);
     lv_obj_set_size(s_food_image, GAME_UI_CELL_PX, GAME_UI_CELL_PX);
     lv_image_set_antialias(s_food_image, false);
     lv_image_set_src(s_food_image, &GAME_UI_APPLE_IMAGE);
-    lv_obj_add_flag(s_head_eye_a, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_head_eye_b, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_food_image, LV_OBJ_FLAG_HIDDEN);
 
     /* 暂停遮罩覆盖游戏页，避免只显示一行容易忽略的提示。 */
     s_pause_overlay = lv_obj_create(s_game_screen);
-    lv_obj_set_pos(s_pause_overlay, 0, 0);
-    lv_obj_set_size(s_pause_overlay, SNAKE_BOARD_WIDTH * GAME_UI_CELL_PX,
-                    GAME_UI_STATUS_BAR_PX + SNAKE_BOARD_HEIGHT * GAME_UI_CELL_PX);
+    /* 只在暂停提示周围建立局部半透明面板，避免覆盖整块棋盘。 */
+    /* 提示面板放在棋盘上方，避免遮住初始蛇身和扭动采样区域。 */
+    lv_obj_set_pos(s_pause_overlay, 176, 40);
+    lv_obj_set_size(s_pause_overlay, 128, 64);
+    lv_obj_set_scrollbar_mode(s_pause_overlay, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_style_bg_color(s_pause_overlay, lv_color_hex(COLOR_BG),
                               LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_pause_overlay, LV_OPA_80, LV_PART_MAIN);
+    /*
+     * 背景不使用覆盖整屏的半透明层：透明层会让 LVGL 在蛇身每次
+     * 位移时重新合成整块屏幕。暂停时改为降低蛇图自身不透明度，
+     * 视觉上仍是“罩住”蛇，但刷新区域保持在发生位移的体节附近。
+     */
+    lv_obj_set_style_bg_opa(s_pause_overlay, LV_OPA_50, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_pause_overlay, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(s_pause_overlay, 0, LV_PART_MAIN);
     lv_obj_t *pause_overlay_title = game_ui_make_label(
@@ -489,24 +540,228 @@ static void game_ui_render_menu(void *user_data)
     lv_screen_load(s_screen);
 }
 
-static uint8_t game_ui_cell_state(uint16_t x, uint16_t y,
-                                  const snake_point_t *segments, uint16_t length,
-                                  snake_point_t food)
-{
-    if (food.x == x && food.y == y) {
-        return 3;
-    }
-    for (uint16_t i = 0; i < length; ++i) {
-        if (segments[i].x == x && segments[i].y == y) {
-            return i == 0 ? 2 : 1;
-        }
-    }
-    return 0;
-}
-
 static bool game_ui_same_point(snake_point_t a, snake_point_t b)
 {
     return a.x == b.x && a.y == b.y;
+}
+
+static snake_direction_t game_ui_opposite_direction(snake_direction_t direction)
+{
+    switch (direction) {
+        case SNAKE_DIRECTION_UP: return SNAKE_DIRECTION_DOWN;
+        case SNAKE_DIRECTION_DOWN: return SNAKE_DIRECTION_UP;
+        case SNAKE_DIRECTION_LEFT: return SNAKE_DIRECTION_RIGHT;
+        case SNAKE_DIRECTION_RIGHT:
+        default: return SNAKE_DIRECTION_LEFT;
+    }
+}
+
+/* 返回相邻节从 from 指向 to 的方向，兼容穿墙跨边界的相邻节。 */
+static snake_direction_t game_ui_direction_between(snake_point_t from,
+                                                   snake_point_t to)
+{
+    if (from.x == to.x) {
+        if ((uint8_t)(from.y + 1U) == to.y ||
+            (from.y == SNAKE_BOARD_HEIGHT - 1U && to.y == 0U)) {
+            return SNAKE_DIRECTION_DOWN;
+        }
+        return SNAKE_DIRECTION_UP;
+    }
+    if ((uint8_t)(from.x + 1U) == to.x ||
+        (from.x == SNAKE_BOARD_WIDTH - 1U && to.x == 0U)) {
+        return SNAKE_DIRECTION_RIGHT;
+    }
+    return SNAKE_DIRECTION_LEFT;
+}
+
+static const lv_image_dsc_t *game_ui_body_source(snake_direction_t direction)
+{
+    switch (direction) {
+        case SNAKE_DIRECTION_UP: return &snake_body_up;
+        case SNAKE_DIRECTION_DOWN: return &snake_body_down;
+        case SNAKE_DIRECTION_LEFT: return &snake_body_left;
+        case SNAKE_DIRECTION_RIGHT:
+        default: return &snake_body_right;
+    }
+}
+
+static const lv_image_dsc_t *game_ui_head_source(snake_direction_t direction)
+{
+    switch (direction) {
+        case SNAKE_DIRECTION_UP: return &snake_head_up;
+        case SNAKE_DIRECTION_DOWN: return &snake_head_down;
+        case SNAKE_DIRECTION_LEFT: return &snake_head_left;
+        case SNAKE_DIRECTION_RIGHT:
+        default: return &snake_head_right;
+    }
+}
+
+static const lv_image_dsc_t *game_ui_tail_source(snake_direction_t direction)
+{
+    /* direction 是尾节指向身体的方向，资源同名端为粗端。 */
+    switch (direction) {
+        case SNAKE_DIRECTION_UP: return &snake_tail_up;
+        case SNAKE_DIRECTION_DOWN: return &snake_tail_down;
+        case SNAKE_DIRECTION_LEFT: return &snake_tail_left;
+        case SNAKE_DIRECTION_RIGHT:
+        default: return &snake_tail_right;
+    }
+}
+
+static const lv_image_dsc_t *game_ui_turn_source(snake_direction_t a,
+                                                 snake_direction_t b)
+{
+    bool up = a == SNAKE_DIRECTION_UP || b == SNAKE_DIRECTION_UP;
+    bool down = a == SNAKE_DIRECTION_DOWN || b == SNAKE_DIRECTION_DOWN;
+    bool left = a == SNAKE_DIRECTION_LEFT || b == SNAKE_DIRECTION_LEFT;
+    bool right = a == SNAKE_DIRECTION_RIGHT || b == SNAKE_DIRECTION_RIGHT;
+    if (up && right) return &snake_turn_up_right;
+    if (right && down) return &snake_turn_right_down;
+    if (down && left) return &snake_turn_down_left;
+    return &snake_turn_left_up;
+}
+
+static const lv_image_dsc_t *game_ui_segment_source(
+    const snake_state_t *state, uint16_t index)
+{
+    if (!state || index >= state->length) {
+        return NULL;
+    }
+    if (index == 0U) {
+        return game_ui_head_source(snake_game_get_direction(&s_game));
+    }
+    if (index + 1U >= state->length) {
+        snake_direction_t toward_head =
+            game_ui_direction_between(state->segments[index],
+                                       state->segments[index - 1U]);
+        return game_ui_tail_source(toward_head);
+    }
+    snake_direction_t toward_head =
+        game_ui_direction_between(state->segments[index],
+                                   state->segments[index - 1U]);
+    snake_direction_t toward_tail =
+        game_ui_direction_between(state->segments[index],
+                                   state->segments[index + 1U]);
+    if (game_ui_opposite_direction(toward_head) == toward_tail) {
+        return game_ui_body_source(toward_head);
+    }
+    return game_ui_turn_source(toward_head, toward_tail);
+}
+
+static int16_t game_ui_wiggle_offset_for(uint16_t index)
+{
+#if GAME_UI_WIGGLE_ENABLE
+    const float phase = ((float)s_wiggle_phase_ms * 2.0f * (float)M_PI) /
+                        (float)GAME_UI_WIGGLE_CYCLE_MS;
+    const float segment_phase =
+        ((float)index * (float)GAME_UI_WIGGLE_SEGMENT_PHASE_DEG *
+         (float)M_PI) / 180.0f;
+    const float value = (float)GAME_UI_WIGGLE_AMPLITUDE_PX *
+                        sinf(phase + segment_phase);
+    int32_t rounded = (int32_t)(value >= 0.0f ? value + 0.5f : value - 0.5f);
+    if (rounded > GAME_UI_WIGGLE_AMPLITUDE_PX) {
+        rounded = GAME_UI_WIGGLE_AMPLITUDE_PX;
+    }
+    if (rounded < -GAME_UI_WIGGLE_AMPLITUDE_PX) {
+        rounded = -GAME_UI_WIGGLE_AMPLITUDE_PX;
+    }
+    return (int16_t)rounded;
+#else
+    (void)index;
+    return 0;
+#endif
+}
+
+static bool game_ui_ensure_snake_image(uint16_t index)
+{
+    if (!s_board || index >= SNAKE_MAX_SEGMENTS) {
+        return false;
+    }
+    if (s_snake_images[index]) {
+        return true;
+    }
+    lv_obj_t *image = lv_image_create(s_board);
+    if (!image) {
+        return false;
+    }
+    lv_obj_remove_style_all(image);
+    lv_obj_set_size(image, GAME_UI_CELL_PX, GAME_UI_CELL_PX);
+    lv_image_set_antialias(image, false);
+    lv_obj_add_flag(image, LV_OBJ_FLAG_HIDDEN);
+    s_snake_images[index] = image;
+    s_snake_rendered_x[index] = INT16_MIN;
+    s_snake_rendered_y[index] = INT16_MIN;
+    if (index >= s_snake_image_count) {
+        s_snake_image_count = (uint16_t)(index + 1U);
+    }
+    return true;
+}
+
+static bool game_ui_segment_is_horizontal(const snake_state_t *state,
+                                          uint16_t index)
+{
+    if (!state || index >= state->length) {
+        return true;
+    }
+    if (index == 0U) {
+        snake_direction_t direction = snake_game_get_direction(&s_game);
+        return direction == SNAKE_DIRECTION_LEFT ||
+               direction == SNAKE_DIRECTION_RIGHT;
+    }
+    snake_direction_t direction =
+        game_ui_direction_between(state->segments[index],
+                                  state->segments[index - 1U]);
+    return direction == SNAKE_DIRECTION_LEFT ||
+           direction == SNAKE_DIRECTION_RIGHT;
+}
+
+static void game_ui_update_snake(const snake_state_t *state)
+{
+    if (!state || !s_board) {
+        return;
+    }
+    s_wiggle_updated_objects = 0;
+    for (uint16_t i = 0; i < state->length; ++i) {
+        if (!game_ui_ensure_snake_image(i)) {
+            break;
+        }
+        lv_obj_t *image = s_snake_images[i];
+        if (!image) {
+            continue;
+        }
+        const lv_image_dsc_t *source = game_ui_segment_source(state, i);
+        if (source != s_snake_sources[i]) {
+            lv_image_set_src(image, source);
+            s_snake_sources[i] = source;
+            ++s_wiggle_updated_objects;
+        }
+        int16_t offset = i == 0U ? 0 : game_ui_wiggle_offset_for(i);
+        s_wiggle_offsets[i] = offset;
+        int16_t x = (int16_t)state->segments[i].x * GAME_UI_CELL_PX;
+        int16_t y = (int16_t)state->segments[i].y * GAME_UI_CELL_PX;
+        if (game_ui_segment_is_horizontal(state, i)) {
+            y = (int16_t)(y + offset);
+        } else {
+            x = (int16_t)(x + offset);
+        }
+        if (s_snake_rendered_x[i] != x || s_snake_rendered_y[i] != y) {
+            lv_obj_set_pos(image, x, y);
+            s_snake_rendered_x[i] = x;
+            s_snake_rendered_y[i] = y;
+            ++s_wiggle_updated_objects;
+        }
+        if (lv_obj_has_flag(image, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_clear_flag(image, LV_OBJ_FLAG_HIDDEN);
+            ++s_wiggle_updated_objects;
+        }
+    }
+    for (uint16_t i = state->length; i < s_snake_image_count; ++i) {
+        lv_obj_t *image = s_snake_images[i];
+        if (image && !lv_obj_has_flag(image, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(image, LV_OBJ_FLAG_HIDDEN);
+            ++s_wiggle_updated_objects;
+        }
+    }
 }
 
 /* 吃到食物时只放大状态栏得分标签，260ms 内回弹，不触碰整屏。 */
@@ -535,58 +790,8 @@ static void game_ui_animate_score(void)
 
 static void game_ui_update_decorations(const snake_state_t *state)
 {
-    if (!state || !s_board || !s_head_eye_a || !s_head_eye_b ||
-        !s_food_image) {
+    if (!state || !s_board || !s_food_image) {
         return;
-    }
-
-    snake_point_t head = {UINT8_MAX, UINT8_MAX};
-    if (state->length > 0) {
-        head = state->segments[0];
-    }
-    snake_direction_t direction = snake_game_get_direction(&s_game);
-    if (!game_ui_same_point(head, s_rendered_head) ||
-        direction != s_rendered_direction) {
-        if (head.x != UINT8_MAX && head.y != UINT8_MAX) {
-            int32_t base_x = (int32_t)head.x * GAME_UI_CELL_PX;
-            int32_t base_y = (int32_t)head.y * GAME_UI_CELL_PX;
-            int32_t eye_ax = base_x + 3;
-            int32_t eye_ay = base_y + 3;
-            int32_t eye_bx = base_x + 10;
-            int32_t eye_by = base_y + 10;
-            switch (direction) {
-                case SNAKE_DIRECTION_DOWN:
-                    eye_ay = eye_by = base_y + 10;
-                    eye_ax = base_x + 3;
-                    eye_bx = base_x + 10;
-                    break;
-                case SNAKE_DIRECTION_LEFT:
-                    eye_ax = eye_bx = base_x + 3;
-                    eye_ay = base_y + 3;
-                    eye_by = base_y + 10;
-                    break;
-                case SNAKE_DIRECTION_UP:
-                    eye_ay = eye_by = base_y + 3;
-                    eye_ax = base_x + 3;
-                    eye_bx = base_x + 10;
-                    break;
-                case SNAKE_DIRECTION_RIGHT:
-                default:
-                    eye_ax = eye_bx = base_x + 10;
-                    eye_ay = base_y + 3;
-                    eye_by = base_y + 10;
-                    break;
-            }
-            lv_obj_set_pos(s_head_eye_a, eye_ax, eye_ay);
-            lv_obj_set_pos(s_head_eye_b, eye_bx, eye_by);
-            lv_obj_clear_flag(s_head_eye_a, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_clear_flag(s_head_eye_b, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(s_head_eye_a, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_head_eye_b, LV_OBJ_FLAG_HIDDEN);
-        }
-        s_rendered_head = head;
-        s_rendered_direction = direction;
     }
 
     if (!game_ui_same_point(state->food, s_rendered_food)) {
@@ -607,21 +812,20 @@ static void game_ui_update_board(void)
     for (uint16_t y = 0; y < SNAKE_BOARD_HEIGHT; ++y) {
         for (uint16_t x = 0; x < SNAKE_BOARD_WIDTH; ++x) {
             uint16_t index = (uint16_t)(y * SNAKE_BOARD_WIDTH + x);
-            uint8_t cell_state = game_ui_cell_state(
-                x, y, state->segments, state->length, state->food);
+            uint8_t cell_state =
+                (state->food.x == x && state->food.y == y) ? 3U : 0U;
             if (cell_state == s_cell_state[index]) {
                 continue;
             }
             s_cell_state[index] = cell_state;
-            uint32_t color = COLOR_BG;
-            if (cell_state == 1) color = COLOR_SNAKE_BODY;
-            if (cell_state == 2) color = COLOR_SNAKE_HEAD;
-            /* 食物由单个 16x16 lv_image 绘制，底格保持棋盘色避免红色方块透出。 */
-            if (cell_state == 3) color = COLOR_BG;
-            lv_obj_set_style_bg_color(s_cells[index], lv_color_hex(color),
-                                      LV_PART_MAIN);
+            /* 蛇和食物都由独立图像绘制，底格始终保持棋盘色。 */
+            if (cell_state == 3U || cell_state == 0U) {
+                lv_obj_set_style_bg_color(s_cells[index], lv_color_hex(COLOR_BG),
+                                          LV_PART_MAIN);
+            }
         }
     }
+    game_ui_update_snake(state);
     game_ui_update_decorations(state);
 }
 
@@ -657,11 +861,19 @@ static void game_ui_render_game(void *user_data)
         } else {
             lv_obj_add_flag(s_pause_overlay, LV_OBJ_FLAG_HIDDEN);
         }
+        for (uint16_t i = 0; i < s_snake_image_count; ++i) {
+            if (s_snake_images[i]) {
+                lv_obj_set_style_opa(s_snake_images[i],
+                                     paused ? LV_OPA_50 : LV_OPA_COVER,
+                                     LV_PART_MAIN);
+            }
+        }
         s_rendered_paused = paused;
     }
     if (lv_screen_active() != s_game_screen) {
         lv_screen_load(s_game_screen);
     }
+    s_wiggle_dirty = false;
 }
 
 static void game_ui_render_end(void *user_data)
@@ -775,10 +987,30 @@ static void game_ui_update_lvgl(void *user_data)
         s_page = GAME_UI_PAGE_END;
         s_render_pending = true;
     }
-    if (s_render_pending || s_page == GAME_UI_PAGE_GAME) {
+    if (s_render_pending ||
+        (s_page == GAME_UI_PAGE_GAME && s_wiggle_dirty)) {
         game_ui_render_current(NULL);
         s_render_pending = false;
+        s_wiggle_dirty = false;
     }
+}
+
+static void game_ui_advance_wiggle(uint32_t elapsed_ms)
+{
+#if GAME_UI_WIGGLE_ENABLE
+    if (s_page != GAME_UI_PAGE_GAME || elapsed_ms == 0U) {
+        return;
+    }
+    s_wiggle_phase_ms =
+        (s_wiggle_phase_ms + elapsed_ms) % GAME_UI_WIGGLE_CYCLE_MS;
+    s_wiggle_elapsed_ms += elapsed_ms;
+    if (s_wiggle_elapsed_ms >= GAME_UI_WIGGLE_UPDATE_MS) {
+        s_wiggle_elapsed_ms %= GAME_UI_WIGGLE_UPDATE_MS;
+        s_wiggle_dirty = true;
+    }
+#else
+    (void)elapsed_ms;
+#endif
 }
 
 void game_ui_update(uint32_t elapsed_ms)
@@ -788,7 +1020,41 @@ void game_ui_update(uint32_t elapsed_ms)
         game_ui_process_key_event(&item);
     }
     if (s_page == GAME_UI_PAGE_GAME) {
+        const snake_state_t *before = snake_game_state(&s_game);
+        snake_point_t before_head = {UINT8_MAX, UINT8_MAX};
+        snake_point_t before_food = {UINT8_MAX, UINT8_MAX};
+        uint16_t before_length = 0;
+        int before_score = 0;
+        bool before_paused = false;
+        bool before_game_over = false;
+        snake_direction_t before_direction = snake_game_get_direction(&s_game);
+        if (before) {
+            if (before->length > 0U) {
+                before_head = before->segments[0];
+            }
+            before_food = before->food;
+            before_length = before->length;
+            before_score = before->score;
+            before_paused = before->paused;
+            before_game_over = before->game_over;
+        }
         snake_game_advance(&s_game, elapsed_ms);
+        const snake_state_t *after = snake_game_state(&s_game);
+        snake_point_t after_head = {UINT8_MAX, UINT8_MAX};
+        if (after && after->length > 0U) {
+            after_head = after->segments[0];
+        }
+        if (!game_ui_same_point(before_head, after_head) ||
+            before_food.x != (after ? after->food.x : UINT8_MAX) ||
+            before_food.y != (after ? after->food.y : UINT8_MAX) ||
+            before_length != (after ? after->length : 0U) ||
+            before_score != (after ? after->score : 0) ||
+            before_paused != (after ? after->paused : false) ||
+            before_game_over != (after ? after->game_over : false) ||
+            before_direction != snake_game_get_direction(&s_game)) {
+            s_render_pending = true;
+        }
+        game_ui_advance_wiggle(elapsed_ms);
     }
     (void)game_ui_port_call(game_ui_update_lvgl, NULL);
 }
@@ -878,4 +1144,22 @@ void game_ui_force_self_collision(void)
     s_game.state.paused = false;
     s_game.state.game_over = false;
     s_render_pending = true;
+}
+
+uint32_t game_ui_get_wiggle_phase_ms(void)
+{
+    return s_wiggle_phase_ms;
+}
+
+int16_t game_ui_get_wiggle_offset(uint16_t segment_index)
+{
+    if (segment_index >= SNAKE_MAX_SEGMENTS) {
+        return 0;
+    }
+    return s_wiggle_offsets[segment_index];
+}
+
+uint16_t game_ui_get_wiggle_updated_objects(void)
+{
+    return s_wiggle_updated_objects;
 }
