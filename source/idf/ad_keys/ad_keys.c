@@ -6,7 +6,9 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -27,6 +29,8 @@
 #define AD_KEYS_DEFAULT_MEDIAN_WINDOW 3
 #define AD_KEYS_DEFAULT_STABLE 2
 #define AD_KEYS_DEFAULT_DEBOUNCE_MS 5
+/* 稳定后还要按住这么久才发 PRESS, 松手回弹 (如 17ms) 不产生事件. */
+#define AD_KEYS_MIN_PRESS_MS 50U
 #define AD_KEYS_DEFAULT_REPEAT_DELAY_MS 200
 #define AD_KEYS_DEFAULT_REPEAT_MS 50
 #define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
@@ -52,7 +56,7 @@ static const uint16_t AD_KEYS_FACTORY_CENTER_MV[AD_KEYS_COUNT] = {
     2397U, /* K5 确定 */
 };
 #ifndef AD_KEYS_LOG_PERIOD_MS
-#define AD_KEYS_LOG_PERIOD_MS 100U
+#define AD_KEYS_LOG_PERIOD_MS 250U
 #endif
 #ifndef AD_KEYS_LOG_DELTA_MV
 #define AD_KEYS_LOG_DELTA_MV 100U
@@ -62,6 +66,7 @@ static const uint16_t AD_KEYS_FACTORY_CENTER_MV[AD_KEYS_COUNT] = {
 #endif
 
 typedef struct {
+    /* NVS 中保存完整窗口，启动时会重新计算窗口并重新建立空闲高水位。 */
     uint32_t version;
     uint16_t min_mv[AD_KEYS_COUNT];
     uint16_t max_mv[AD_KEYS_COUNT];
@@ -70,6 +75,7 @@ typedef struct {
 } ad_keys_nvs_blob_t;
 
 typedef struct {
+    /* 硬件和任务资源。ADC 句柄只由采样任务使用，lock 保护公开快照/配置。 */
     adc_oneshot_unit_handle_t adc_handle;
     adc_cali_handle_t cali_handle;
     bool cali_enabled;
@@ -77,6 +83,7 @@ typedef struct {
     SemaphoreHandle_t lock;
     ad_keys_config_t cfg;
 
+    /* 运行/标定状态。calibration_index 表示下一个待采集的键号。 */
     bool running;
     bool calibration_valid;
     bool calibrating;
@@ -88,6 +95,7 @@ typedef struct {
     uint16_t max_mv[AD_KEYS_COUNT];
     uint16_t idle_mv;
 
+    /* 中值滤波环形缓冲和启动时的空闲电压高水位。 */
     uint16_t history[AD_KEYS_SAMPLE_BUF];
     uint8_t history_count;
     uint8_t history_pos;
@@ -95,15 +103,19 @@ typedef struct {
     uint8_t idle_samples;
     bool idle_ready;
 
+    /* 当前候选键与连发计时。 */
     uint8_t candidate_key;
     uint8_t candidate_count;
     uint32_t candidate_since_ms;
     uint16_t calibration_samples[AD_KEYS_SAMPLE_BUF];
     uint8_t calibration_sample_count;
     uint8_t current_key;
+    /* 已稳定按下, 未满最短按住时间, 期间不发 PRESS. */
+    uint8_t armed_key;
     uint32_t press_start_ms;
     uint32_t next_repeat_ms;
 
+    /* 诊断快照；日志字段与最近一次 ADC 采样分开保存。 */
     uint16_t last_voltage_mv;
     uint16_t last_raw_voltage_mv;
     uint32_t last_log_ms;
@@ -185,18 +197,26 @@ static void emit_event(ad_keys_event_type_t type, uint8_t key, uint16_t voltage,
     if (key == 0 || key > AD_KEYS_COUNT) {
         return;
     }
-    s_ctx.log_event_pending = true;
+    /* 连发事件只保留 DEBUG，不触发 ADC INFO 快照；按下/释放仍立即纳入诊断。 */
+    if (type != AD_KEYS_EVENT_REPEAT) {
+        s_ctx.log_event_pending = true;
+    }
     ad_keys_event_t event = {
         .key = key,
         .type = type,
         .voltage_mv = voltage,
         .held_ms = held,
     };
-    ESP_LOGI(AD_KEYS_TAG, "事件 K%u: %s, %umV, held=%ums", key,
-             type == AD_KEYS_EVENT_PRESS ? "PRESS" :
-             type == AD_KEYS_EVENT_LONG ? "LONG" :
-             type == AD_KEYS_EVENT_REPEAT ? "REPEAT" : "RELEASE",
-             voltage, (unsigned)held);
+    /* 连发周期可能只有 50ms，REPEAT 降为 DEBUG，避免正常长按刷屏。 */
+    if (type == AD_KEYS_EVENT_REPEAT) {
+        ESP_LOGD(AD_KEYS_TAG, "事件 K%u: REPEAT, %umV, held=%ums", key,
+                 voltage, (unsigned)held);
+    } else {
+        ESP_LOGI(AD_KEYS_TAG, "事件 K%u: %s, %umV, held=%ums", key,
+                 type == AD_KEYS_EVENT_PRESS ? "PRESS" :
+                 type == AD_KEYS_EVENT_LONG ? "LONG" : "RELEASE",
+                 voltage, (unsigned)held);
+    }
     if (cb) {
         cb(&event, s_ctx.cfg.event_user_ctx);
     }
@@ -359,6 +379,15 @@ static esp_err_t load_calibration_locked(void)
     s_ctx.idle_ready = false;
     s_ctx.calibration_valid = true;
     calculate_windows_locked();
+    ESP_LOGI(AD_KEYS_TAG,
+             "加载 NVS 标定：K1=%u K2=%u K3=%u K4=%u K5=%umV，"
+             "窗口 K1=%u..%u K2=%u..%u K3=%u..%u K4=%u..%u K5=%u..%u，"
+             "空闲基线启动后重新采样",
+             s_ctx.centers_mv[0], s_ctx.centers_mv[1], s_ctx.centers_mv[2],
+             s_ctx.centers_mv[3], s_ctx.centers_mv[4],
+             s_ctx.min_mv[0], s_ctx.max_mv[0], s_ctx.min_mv[1], s_ctx.max_mv[1],
+             s_ctx.min_mv[2], s_ctx.max_mv[2], s_ctx.min_mv[3], s_ctx.max_mv[3],
+             s_ctx.min_mv[4], s_ctx.max_mv[4]);
     return ESP_OK;
 }
 
@@ -517,18 +546,41 @@ static void process_key(uint16_t voltage_mv, uint32_t tick_ms)
 
     bool stable = s_ctx.candidate_count >= s_ctx.cfg.stable_samples &&
                   (tick_ms - s_ctx.candidate_since_ms) >= (uint32_t)s_ctx.cfg.debounce_ms;
+
+    /* 最短按住时间未到就离开窗口: 回弹, 不发 PRESS/RELEASE. */
+    if (s_ctx.armed_key != 0) {
+        bool arm_lost = stable && key != s_ctx.armed_key;
+        bool arm_ready = stable && key == s_ctx.armed_key &&
+                         (tick_ms - s_ctx.press_start_ms) >= AD_KEYS_MIN_PRESS_MS;
+
+        if (arm_lost) {
+            ESP_LOGI(AD_KEYS_TAG, "忽略过短按键 K%u, held=%ums",
+                     (unsigned)s_ctx.armed_key,
+                     (unsigned)(tick_ms - s_ctx.press_start_ms));
+            s_ctx.armed_key = 0;
+        } else if (arm_ready) {
+            s_ctx.current_key = s_ctx.armed_key;
+            s_ctx.armed_key = 0;
+            s_ctx.next_repeat_ms =
+                tick_ms + (uint32_t)s_ctx.cfg.repeat_delay_ms;
+            emit_event(AD_KEYS_EVENT_PRESS, s_ctx.current_key, voltage_mv, 0);
+            return;
+        } else {
+            return;
+        }
+    }
+
     if (stable && key != s_ctx.current_key) {
         if (s_ctx.current_key != 0) {
             emit_event(AD_KEYS_EVENT_RELEASE, s_ctx.current_key, voltage_mv,
                        tick_ms - s_ctx.press_start_ms);
+            s_ctx.current_key = 0;
         }
-        s_ctx.current_key = key;
         if (key != 0) {
+            s_ctx.armed_key = key;
             s_ctx.press_start_ms = tick_ms;
-            s_ctx.next_repeat_ms =
-                tick_ms + (uint32_t)s_ctx.cfg.repeat_delay_ms;
-            emit_event(AD_KEYS_EVENT_PRESS, key, voltage_mv, 0);
         }
+        return;
     }
 
     /* 按下后 repeat_delay_ms 开始连发, 不再插入长按事件. */
@@ -580,8 +632,24 @@ static void maybe_log_sample(uint32_t tick_ms, uint16_t raw_mv, uint16_t filtere
         return;
     }
 
-    ESP_LOGI(AD_KEYS_TAG, "ADC raw=%umV filtered=%umV key=%u",
-             raw_mv, filtered_mv, s_ctx.current_key);
+    if (heartbeat_due) {
+        size_t internal_free =
+            heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGI(AD_KEYS_TAG,
+                 "ADC raw=%umV filtered=%umV key=%u candidate=%u(%u/%d) "
+                 "idle=%umV cal=%s stack_free=%u heap=%u internal=%u",
+                 raw_mv, filtered_mv, s_ctx.current_key,
+                 s_ctx.candidate_key, s_ctx.candidate_count,
+                 s_ctx.cfg.stable_samples, s_ctx.idle_mv,
+                 s_ctx.calibration_valid ? "valid" : "fallback",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                 (unsigned)esp_get_free_heap_size(), (unsigned)internal_free);
+    } else {
+        ESP_LOGI(AD_KEYS_TAG, "ADC raw=%umV filtered=%umV key=%u candidate=%u(%u/%d)",
+                 raw_mv, filtered_mv, s_ctx.current_key,
+                 s_ctx.candidate_key, s_ctx.candidate_count,
+                 s_ctx.cfg.stable_samples);
+    }
     s_ctx.last_log_ms = tick_ms;
     s_ctx.last_logged_voltage_mv = filtered_mv;
     s_ctx.last_logged_key = s_ctx.current_key;
@@ -594,9 +662,11 @@ static void ad_keys_task(void *arg)
 {
     (void)arg;
     const TickType_t period = pdMS_TO_TICKS(s_ctx.cfg.sample_period_ms);
+    uint32_t read_error_count = 0;
     while (s_ctx.running) {
         uint16_t voltage = 0;
-        if (read_voltage_mv(&voltage) == ESP_OK) {
+        esp_err_t read_err = read_voltage_mv(&voltage);
+        if (read_err == ESP_OK) {
             uint16_t filtered = push_and_get_median(voltage);
             uint32_t tick_ms = now_ms();
             if (!s_ctx.idle_ready && s_ctx.idle_samples < 20) {
@@ -645,9 +715,20 @@ static void ad_keys_task(void *arg)
                 process_key(filtered, tick_ms);
             }
             maybe_log_sample(tick_ms, s_ctx.last_raw_voltage_mv, filtered);
+        } else {
+            ++read_error_count;
+            /* ADC 瞬时读失败不应每 5ms 刷屏；首次和每 100 次各报一次。 */
+            if (read_error_count == 1U || (read_error_count % 100U) == 0U) {
+                ESP_LOGW(AD_KEYS_TAG, "ADC 采样失败 #%lu: %s",
+                         (unsigned long)read_error_count,
+                         esp_err_to_name(read_err));
+            }
         }
         vTaskDelay(period);
     }
+    ESP_LOGI(AD_KEYS_TAG, "按键任务退出，stack_free=%u，ADC 失败次数=%lu",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned long)read_error_count);
     s_ctx.task = NULL;
     vTaskDelete(NULL);
 }
@@ -727,6 +808,13 @@ esp_err_t ad_keys_init(const ad_keys_config_t *config)
     if (err != ESP_OK) {
         ESP_LOGW(AD_KEYS_TAG, "未找到有效标定数据，请进入标定模式");
     }
+    ESP_LOGI(AD_KEYS_TAG,
+             "初始化完成：ADC1_CH0(GPIO%d)，校准=%s，采样=%dms，中值=%d，稳定=%d，"
+             "重复延迟=%dms/%dms，标定窗口=%umV",
+             AD_KEYS_GPIO, s_ctx.cali_enabled ? "enabled" : "approx",
+             s_ctx.cfg.sample_period_ms, s_ctx.cfg.median_window,
+             s_ctx.cfg.stable_samples, s_ctx.cfg.repeat_delay_ms,
+             s_ctx.cfg.repeat_ms, calibration_min_delta_mv());
     return ESP_OK;
 }
 
@@ -746,6 +834,10 @@ esp_err_t ad_keys_start(void)
     }
     ESP_LOGI(AD_KEYS_TAG, "按键任务已钉到核 %d, 优先级 5, 采样 %dms",
              AD_KEYS_TASK_CORE, s_ctx.cfg.sample_period_ms);
+    ESP_LOGI(AD_KEYS_TAG, "按键任务栈余量初值=%u words，标定=%s，空闲基线=%s",
+             (unsigned)uxTaskGetStackHighWaterMark(s_ctx.task),
+             s_ctx.calibration_valid ? "valid" : "fallback",
+             s_ctx.idle_ready ? "ready" : "sampling");
     return ESP_OK;
 }
 
@@ -777,6 +869,7 @@ esp_err_t ad_keys_deinit(void)
         s_ctx.adc_handle = NULL;
     }
     vSemaphoreDelete(s_ctx.lock);
+    ESP_LOGI(AD_KEYS_TAG, "按键驱动已释放");
     memset(&s_ctx, 0, sizeof(s_ctx));
     return ESP_OK;
 }
@@ -811,6 +904,7 @@ esp_err_t ad_keys_start_calibration(void)
 {
 #if !AD_KEYS_ENABLE_RUNTIME_SAMPLING
     start_calibration_locked();
+    ESP_LOGW(AD_KEYS_TAG, "忽略标定请求：运行时采样功能未启用");
     return ESP_ERR_NOT_SUPPORTED;
 #else
     if (!s_ctx.lock) {
@@ -908,6 +1002,7 @@ esp_err_t ad_keys_clear_calibration(void)
     }
     nvs_close(nvs);
     s_ctx.calibration_valid = false;
+    ESP_LOGI(AD_KEYS_TAG, "NVS 按键标定已清除，下一次启动将使用出厂窗口");
     return err;
 }
 
