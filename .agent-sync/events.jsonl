@@ -1,0 +1,13 @@
+{"ts": "2026-09-26 11:19:15", "kind": "task_start", "actor": "daemon", "summary": "codex 任务开始（PID 827842）", "evidence": {"rollout": "/home/gaofeng/.codex/sessions/2026/09/26/rollout-2026-09-26T10-58-49-01a0dba6-b179-7752-a93f-8d2211e6e71b.jsonl"}}
+{"ts": "2026-09-26 11:19:24", "kind": "commit", "actor": "hermes", "summary": "P0 骨架：工程初始化 + git init（含硬件引脚 README）", "evidence": {"commit": "2c65778"}}
+{"ts": "2026-09-26 11:19:24", "kind": "dispatch", "actor": "hermes", "summary": "P1 派发：屏+触摸+AD单路五键(自动标定/NVS/事件)+按键测试页", "evidence": {}}
+{"ts": "2026-09-26 11:19:24", "kind": "verify", "actor": "hermes", "summary": "P1 验收通过：分区表无 otadata、NVS@0x500000、横屏480x320、AD键参数(5键/GPIO1/中值5/去抖25ms)、参考工程未被改", "evidence": {"commit": "a121fd5"}}
+{"ts": "2026-09-26 11:19:24", "kind": "fix", "actor": "hermes", "summary": "发现并修正：P1 交接文档 SHA256 是旧构建值(文档23:52写/产物23:57重建)，已按实测更正", "evidence": {}}
+{"ts": "2026-09-26 11:19:24", "kind": "dispatch", "actor": "hermes", "summary": "P2 派发：贪吃蛇(穿墙默认开) + PC LVGL/SDL2 模拟器", "evidence": {}}
+{"ts": "2026-09-26 11:19:24", "kind": "verify", "actor": "hermes", "summary": "P2 验收：逻辑自测11项 PASS(hermes重跑)；发现关键缺口=模拟器未链接 game_ui.c，截图为模拟器自绘UI", "evidence": {"commit": "ec0e66a"}}
+{"ts": "2026-09-26 11:19:24", "kind": "fix", "actor": "hermes", "summary": "P3 派发：修缺口(模拟器共编译真实设备UI) + 状态栏独立占位(棋盘30x20->30x18) + 儿童向UI", "evidence": {}}
+{"ts": "2026-09-26 11:19:24", "kind": "verify", "actor": "hermes", "summary": "P3 验收通过：符号证据 game_ui_* 进入 snake_sim；UI冒烟9项 PASS；merged 753664B 7bf3a84f", "evidence": {"commit": "c3a32cd"}}
+{"ts": "2026-09-26 11:19:24", "kind": "dispatch", "actor": "hermes", "summary": "P4 派发：儿童向UI打磨(网格隐化/边界描边/蛇头眼睛随方向/键位提示/暂停遮罩/结束文案)", "evidence": {}}
+{"ts": "2026-09-26 11:19:24", "kind": "verify", "actor": "hermes", "summary": "P4 验收通过：自测20项(逻辑11+UI9) hermes重跑全PASS；merged 755088B f71dfdb7；面板工程未被改", "evidence": {"commit": "b99ab4a"}}
+{"ts": "2026-09-26 11:19:24", "kind": "dispatch", "actor": "hermes", "summary": "P5 派发：食物改16x16像素苹果(lv_image)，出3个候选风格对比图供用户挑", "evidence": {}}
+{"ts": "2026-09-26 11:33:00", "kind": "task_end", "actor": "daemon", "summary": "codex 任务结束（开始于 2026-09-26 11:19:15）", "evidence": {"last_activity": null}}

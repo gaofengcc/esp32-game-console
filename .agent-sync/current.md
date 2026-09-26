@@ -162,3 +162,49 @@
 - 键位提示宏位于 `source/idf/game_ui/game_ui.c` 顶部：`GAME_UI_KEY1_TEXT`、`GAME_UI_KEY2_TEXT`、`GAME_UI_KEY3_TEXT`、`GAME_UI_KEY5_TEXT`。
 - `game_ui.c` 保持局部刷新：运行中只比较并重绘变化格子；状态栏分数/最高分仅在数值变化时更新；新局/重试才做一次棋盘全量失效。
 - 吃食物动画只作用于单个得分标签，时长 `130ms + 130ms = 260ms`，没有整屏动画。
+
+## P5 像素苹果食物交接（2026-09-26）
+
+### 实现
+
+- `source/idf/game_ui/game_ui.c` 使用单个 `lv_image_create()` 食物对象，替换原纯红格子 + 独立高光对象。
+- 食物资源为 `lv_image_dsc_t` / `LV_COLOR_FORMAT_RGB565`：
+  - `w=16`、`h=16`、`stride=32`、`data_size=512`
+  - `source/idf/game_ui/assets/apple_16x16_a.h`：A 经典红苹果（默认）
+  - `source/idf/game_ui/assets/apple_16x16_b.h`：B 卡通亮眼版
+  - `source/idf/game_ui/assets/apple_16x16_c.h`：C 简洁版
+- 食物对象只在坐标变化时调用 `lv_obj_set_pos()`；食物格状态仍走原有局部状态比较，底格回到 `COLOR_BG`，没有逐帧/整屏重绘。
+- `lv_image_set_antialias(..., false)` 保证像素边缘不被平滑。
+
+### 生成脚本与切换
+
+- 脚本：`/home/gaofeng/code/esp32-game-console/tools/generate_apples.py`
+- 用法：`python3 tools/generate_apples.py`
+- 默认宏位于 `source/idf/game_ui/game_ui.c`：
+  - `GAME_UI_APPLE_STYLE=0`：A（默认）
+  - `GAME_UI_APPLE_STYLE=1`：B
+  - `GAME_UI_APPLE_STYLE=2`：C
+  - 例如构建时追加 `-DGAME_UI_APPLE_STYLE=1` 即切换到 B。
+
+### RGB565 字节序
+
+- 脚本按 native RGB565 little-endian 输出每个像素（低字节在前），头文件使用 `LV_COLOR_FORMAT_RGB565`，不是 `RGB565_SWAPPED`。
+- `source/components/lv_conf.h` 和模拟器 LVGL 配置均未启用 `LV_COLOR_16_SWAP`；SDL 模拟器截图实测苹果为正常红色、绿色叶片和棕色果柄，没有红绿/红蓝颠倒。
+
+### 交付截图
+
+- `/home/gaofeng/code/esp32-game-console/output/sim/apple_candidates.png`：480x320，A/B/C 三列，每个 6x 最近邻放大并附 1:1 16x16 版本。
+- `/home/gaofeng/code/esp32-game-console/output/sim/apple_ingame.png`：480x320 真实 `game` 场景，包含状态栏、30x18 棋盘、蛇和默认 A 苹果。
+- 单候选预览：`output/sim/apple_A_classic_1x.png`、`output/sim/apple_B_bright_1x.png`、`output/sim/apple_C_simple_1x.png`。
+
+### 验收
+
+- `cmake --build simulator/build -j2`：通过。
+- `SDL_VIDEODRIVER=dummy ./simulator/build/snake_test --selftest`：20 项全 PASS（逻辑 11 + UI 9），完整输出见 `/home/gaofeng/code/esp32-game-console/output/sim/snake_test_final.log`。
+- `./build_esp32.sh`：通过（ESP-IDF `/home/gaofeng/esp/esp-idf-v5.3.5`，本地工具链 13.2.0）。
+- 固件产物：
+  - `/home/gaofeng/code/esp32-game-console/output/esp32_game_console.bin`：690160 bytes，SHA256 `dcfc04edfabe024259c76f4778682f3db50d8203e1c844a0b57ccfc0745dd1d2`
+  - `/home/gaofeng/code/esp32-game-console/output/esp32_game_console_merged.bin`：755696 bytes，SHA256 `c29b2af6354da66eb4756636314ba4e1415c0ef77b0d62939f0f73a2fc5be89c`
+  - `/home/gaofeng/code/esp32-game-console/output/bootloader.bin`：21568 bytes，SHA256 `17a72d10a871ec289b456e2c51d237123c7eb65e9afe2d2ba94ae43e9579a784`
+  - `/home/gaofeng/code/esp32-game-console/output/partition-table.bin`：3072 bytes，SHA256 `258033a541f09c71f12b0456b6083f5ee86efd340c1d0211a369eb708c863935`
+- 未烧录、未调用 Win10 串口桥，未修改 `Nas-assistant`、`esp32-lab-bridge` 或 `LCD_Drivers`。

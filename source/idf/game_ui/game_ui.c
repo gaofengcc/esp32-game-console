@@ -5,6 +5,24 @@
 #include "game_ui_port.h"
 #include "lvgl.h"
 
+/* 默认使用 A 经典红苹果；编译时设为 1/2 可切换 B 卡通亮眼版/C 简洁版。 */
+#ifndef GAME_UI_APPLE_STYLE
+#define GAME_UI_APPLE_STYLE 0
+#endif
+
+#if GAME_UI_APPLE_STYLE == 0
+#include "assets/apple_16x16_a.h"
+#define GAME_UI_APPLE_IMAGE apple_16x16_a
+#elif GAME_UI_APPLE_STYLE == 1
+#include "assets/apple_16x16_b.h"
+#define GAME_UI_APPLE_IMAGE apple_16x16_b
+#elif GAME_UI_APPLE_STYLE == 2
+#include "assets/apple_16x16_c.h"
+#define GAME_UI_APPLE_IMAGE apple_16x16_c
+#else
+#error "GAME_UI_APPLE_STYLE must be 0 (A), 1 (B), or 2 (C)"
+#endif
+
 extern const lv_font_t lv_font_cjk_16;
 
 #define GAME_UI_KEY_QUEUE_LEN 24
@@ -47,7 +65,6 @@ extern const lv_font_t lv_font_cjk_16;
 #define COLOR_BUTTON 0x263238
 #define COLOR_BUTTON_PRESSED 0x34545E
 #define COLOR_EYE 0x18332B
-#define COLOR_FOOD_GLINT 0xFFF8E1
 
 typedef enum {
     GAME_UI_PAGE_MENU = 0,
@@ -83,7 +100,7 @@ static lv_obj_t *s_cells[GAME_UI_BOARD_CELLS];
 static uint8_t s_cell_state[GAME_UI_BOARD_CELLS];
 static lv_obj_t *s_head_eye_a;
 static lv_obj_t *s_head_eye_b;
-static lv_obj_t *s_food_glint;
+static lv_obj_t *s_food_image;
 static lv_obj_t *s_score_label;
 static lv_obj_t *s_best_label;
 static lv_obj_t *s_pause_overlay;
@@ -389,13 +406,17 @@ static void game_ui_create_game_screen(void)
         s_board, SNAKE_BOARD_WIDTH * GAME_UI_CELL_PX - 2, 0, 2,
         SNAKE_BOARD_HEIGHT * GAME_UI_CELL_PX, COLOR_ACCENT);
 
-    /* 蛇头眼睛、食物高光是独立小对象，只在坐标/方向变化时更新。 */
+    /* 蛇头眼睛、食物图像只在坐标/方向变化时更新，避免每帧重绘。 */
     s_head_eye_a = game_ui_make_rect(s_board, 0, 0, 3, 3, COLOR_EYE);
     s_head_eye_b = game_ui_make_rect(s_board, 0, 0, 3, 3, COLOR_EYE);
-    s_food_glint = game_ui_make_rect(s_board, 0, 0, 2, 2, COLOR_FOOD_GLINT);
+    s_food_image = lv_image_create(s_board);
+    lv_obj_remove_style_all(s_food_image);
+    lv_obj_set_size(s_food_image, GAME_UI_CELL_PX, GAME_UI_CELL_PX);
+    lv_image_set_antialias(s_food_image, false);
+    lv_image_set_src(s_food_image, &GAME_UI_APPLE_IMAGE);
     lv_obj_add_flag(s_head_eye_a, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_head_eye_b, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(s_food_glint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_food_image, LV_OBJ_FLAG_HIDDEN);
 
     /* 暂停遮罩覆盖游戏页，避免只显示一行容易忽略的提示。 */
     s_pause_overlay = lv_obj_create(s_game_screen);
@@ -515,7 +536,7 @@ static void game_ui_animate_score(void)
 static void game_ui_update_decorations(const snake_state_t *state)
 {
     if (!state || !s_board || !s_head_eye_a || !s_head_eye_b ||
-        !s_food_glint) {
+        !s_food_image) {
         return;
     }
 
@@ -569,10 +590,10 @@ static void game_ui_update_decorations(const snake_state_t *state)
     }
 
     if (!game_ui_same_point(state->food, s_rendered_food)) {
-        int32_t food_x = (int32_t)state->food.x * GAME_UI_CELL_PX + 3;
-        int32_t food_y = (int32_t)state->food.y * GAME_UI_CELL_PX + 3;
-        lv_obj_set_pos(s_food_glint, food_x, food_y);
-        lv_obj_clear_flag(s_food_glint, LV_OBJ_FLAG_HIDDEN);
+        int32_t food_x = (int32_t)state->food.x * GAME_UI_CELL_PX;
+        int32_t food_y = (int32_t)state->food.y * GAME_UI_CELL_PX;
+        lv_obj_set_pos(s_food_image, food_x, food_y);
+        lv_obj_clear_flag(s_food_image, LV_OBJ_FLAG_HIDDEN);
         s_rendered_food = state->food;
     }
 }
@@ -595,7 +616,8 @@ static void game_ui_update_board(void)
             uint32_t color = COLOR_BG;
             if (cell_state == 1) color = COLOR_SNAKE_BODY;
             if (cell_state == 2) color = COLOR_SNAKE_HEAD;
-            if (cell_state == 3) color = COLOR_FOOD;
+            /* 食物由单个 16x16 lv_image 绘制，底格保持棋盘色避免红色方块透出。 */
+            if (cell_state == 3) color = COLOR_BG;
             lv_obj_set_style_bg_color(s_cells[index], lv_color_hex(color),
                                       LV_PART_MAIN);
         }

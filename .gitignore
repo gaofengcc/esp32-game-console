@@ -7,3 +7,4 @@ dependencies.lock
 output/
 *.bin
 .cache/
+.vscode/
