@@ -15,6 +15,7 @@ typedef enum {
     GAME_SELECT_NONE = 0,
     GAME_SELECT_SNAKE,
     GAME_SELECT_MAZE,
+    GAME_SELECT_KLOTSKI,
 } game_select_id_t;
 
 typedef void (*game_select_choose_cb_t)(game_select_id_t id);
