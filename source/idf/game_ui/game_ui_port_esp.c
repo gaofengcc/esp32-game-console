@@ -46,6 +46,8 @@ int game_ui_port_load_best(int *score)
         return 0;
     }
     if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "读取贪吃蛇最高分失败: %s",
+                 esp_err_to_name(err));
         return -1;
     }
     uint32_t value = 0;
@@ -55,6 +57,8 @@ int game_ui_port_load_best(int *score)
         return 0;
     }
     if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "读取贪吃蛇最高分键失败: %s",
+                 esp_err_to_name(err));
         return -1;
     }
     *score = (int)value;
@@ -70,14 +74,99 @@ int game_ui_port_load_best(int *score)
 int game_ui_port_save_best(int score)
 {
     nvs_handle_t handle;
-    if (nvs_open("game", NVS_READWRITE, &handle) != ESP_OK) {
+    esp_err_t err = nvs_open("game", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "打开最高分 NVS 失败: %s",
+                 esp_err_to_name(err));
         return -1;
     }
-    esp_err_t err = nvs_set_u32(handle, "high_score", (uint32_t)score);
+    err = nvs_set_u32(handle, "high_score", (uint32_t)score);
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
     nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "保存贪吃蛇最高分失败: %s",
+                 esp_err_to_name(err));
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/**
+ * @brief 从 NVS namespace game 按 key 读取定长 blob.
+ *
+ * @param key 存储键.
+ * @param buf 输出缓冲.
+ * @param len 期望长度, 不一致视为无记录.
+ * @return 0 成功; 1 尚无记录; -1 失败.
+ */
+int game_ui_port_load_blob(const char *key, void *buf, size_t len)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+    size_t actual = len;
+
+    if (!key || !buf || len == 0U) {
+        return -1;
+    }
+    err = nvs_open("game", NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return 1;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "打开游戏 blob NVS 失败(key=%s): %s",
+                 key, esp_err_to_name(err));
+        return -1;
+    }
+    err = nvs_get_blob(handle, key, buf, &actual);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return 1;
+    }
+    if (actual != len) {
+        ESP_LOGW(GAME_UI_PORT_TAG,
+                 "游戏 blob 长度不匹配(key=%s, expected=%u, actual=%u)",
+                 key, (unsigned)len, (unsigned)actual);
+        return 1;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "读取游戏 blob 失败(key=%s): %s",
+                 key, esp_err_to_name(err));
+    }
+    return err == ESP_OK ? 0 : -1;
+}
+
+/**
+ * @brief 把定长 blob 写进 NVS namespace game.
+ *
+ * @param key 存储键.
+ * @param buf 数据.
+ * @param len 数据长度.
+ * @return 0 成功; -1 失败.
+ */
+int game_ui_port_save_blob(const char *key, const void *buf, size_t len)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    if (!key || !buf || len == 0U) {
+        return -1;
+    }
+    err = nvs_open("game", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "打开游戏 blob NVS 失败(key=%s): %s",
+                 key, esp_err_to_name(err));
+        return -1;
+    }
+    err = nvs_set_blob(handle, key, buf, len);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(GAME_UI_PORT_TAG, "保存游戏 blob 失败(key=%s): %s",
+                 key, esp_err_to_name(err));
+    }
     return err == ESP_OK ? 0 : -1;
 }
 
@@ -126,10 +215,17 @@ esp_err_t game_ui_port_start_task(game_ui_port_task_fn_t task, const char *name,
     }
     if (xTaskCreatePinnedToCore(task, name, stack_size, arg, priority,
                                 &handle, GAME_UI_LOGIC_CORE) != pdPASS) {
+        ESP_LOGE(GAME_UI_PORT_TAG,
+                 "创建逻辑任务失败(name=%s, stack=%lu, priority=%lu)",
+                 name, (unsigned long)stack_size, (unsigned long)priority);
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(GAME_UI_PORT_TAG, "逻辑任务 %s 已钉到核 %d, 优先级 %lu",
-             name, GAME_UI_LOGIC_CORE, (unsigned long)priority);
+    ESP_LOGI(GAME_UI_PORT_TAG,
+             "逻辑任务 %s 已钉到核 %d, 优先级 %lu, stack=%lu words, "
+             "stack_free=%u",
+             name, GAME_UI_LOGIC_CORE, (unsigned long)priority,
+             (unsigned long)stack_size,
+             (unsigned)uxTaskGetStackHighWaterMark(handle));
     return ESP_OK;
 }
 

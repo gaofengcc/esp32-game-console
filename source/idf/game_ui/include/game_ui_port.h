@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "ad_keys.h"
@@ -40,6 +41,26 @@ int game_ui_port_load_best(int *score);
  * @return 0 成功; -1 失败.
  */
 int game_ui_port_save_best(int score);
+
+/**
+ * @brief 按 key 读取定长持久化数据块, 供多关卡游戏存每关最佳成绩.
+ *
+ * @param key 存储键, 不能为空; 设备端受 NVS 限制最长 15 字符.
+ * @param buf 输出缓冲, 不能为空.
+ * @param len 期望长度, 读到的数据长度不一致视为无记录.
+ * @return 0 成功读到; 1 尚无记录; -1 失败.
+ */
+int game_ui_port_load_blob(const char *key, void *buf, size_t len);
+
+/**
+ * @brief 按 key 写入定长持久化数据块.
+ *
+ * @param key 存储键, 不能为空; 设备端受 NVS 限制最长 15 字符.
+ * @param buf 数据, 不能为空.
+ * @param len 数据长度, 不能为 0.
+ * @return 0 成功; -1 失败.
+ */
+int game_ui_port_save_blob(const char *key, const void *buf, size_t len);
 
 /**
  * @brief 把工作切到 LVGL 线程执行.
