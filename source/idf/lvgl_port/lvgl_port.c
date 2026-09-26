@@ -13,6 +13,7 @@
 #include "lcd_driver.h"
 #include "touch_driver.h"
 #include "board_lcd_pins.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs.h"
@@ -938,6 +939,18 @@ static uint8_t lvgl_port_expand6(uint16_t value)
     return (uint8_t)((value << 2) | (value >> 4));
 }
 
+static void *lvgl_port_alloc_buffer(size_t size)
+{
+    void *buffer = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer == NULL) {
+        buffer = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    if (buffer == NULL) {
+        buffer = malloc(size);
+    }
+    return buffer;
+}
+
 static void lvgl_port_encode_row_bgr(const uint16_t *src, uint8_t *dst,
                                      uint32_t width)
 {
@@ -987,7 +1000,7 @@ static bool lvgl_port_encode_bmp_from_rgb565(const uint8_t *framebuffer,
     uint32_t row_stride = (row_bytes + 3U) & ~3U;
     uint32_t pixel_bytes = row_stride * height;
     size_t total = 54U + (size_t)pixel_bytes;
-    uint8_t *bmp = (uint8_t *)malloc(total);
+    uint8_t *bmp = (uint8_t *)lvgl_port_alloc_buffer(total);
     if (bmp == NULL) {
         return false;
     }
@@ -1038,7 +1051,7 @@ static void lvgl_port_capture_in_lvgl_task(void *user_data)
     }
 
     size_t framebuffer_size = (size_t)stride * height;
-    uint8_t *framebuffer = (uint8_t *)malloc(framebuffer_size);
+    uint8_t *framebuffer = (uint8_t *)lvgl_port_alloc_buffer(framebuffer_size);
     if (framebuffer == NULL) {
         request->result = ESP_ERR_NO_MEM;
         return;
