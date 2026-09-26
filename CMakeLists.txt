@@ -19,18 +19,21 @@ project(esp32_game_console)
 if(CONFIG_LVGL_SCREENSHOT_ENABLE)
     idf_component_get_property(_lvgl_screenshot_lib lvgl_screenshot COMPONENT_LIB)
     if(_lvgl_screenshot_lib)
+        idf_component_get_property(_lvgl_lib lvgl__lvgl COMPONENT_LIB)
+        idf_component_get_property(_lvgl_include_dirs lvgl__lvgl INCLUDE_DIRS)
+        idf_component_get_property(_lvgl_port_lib lvgl_port COMPONENT_LIB)
+        idf_component_get_property(_lvgl_port_include_dirs lvgl_port INCLUDE_DIRS)
         target_include_directories(
             ${_lvgl_screenshot_lib}
             PRIVATE
-                "${CMAKE_CURRENT_LIST_DIR}/managed_components/lvgl__lvgl"
-                "${CMAKE_CURRENT_LIST_DIR}/managed_components/lvgl__lvgl/src"
-                "${CMAKE_CURRENT_LIST_DIR}/source/idf/lvgl_port/include"
+                ${_lvgl_include_dirs}
+                ${_lvgl_port_include_dirs}
         )
         target_link_libraries(
             ${_lvgl_screenshot_lib}
             PRIVATE
-                idf::lvgl__lvgl
-                idf::lvgl_port
+                ${_lvgl_lib}
+                ${_lvgl_port_lib}
         )
     endif()
 endif()
