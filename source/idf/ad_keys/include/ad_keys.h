@@ -50,7 +50,7 @@ typedef struct {
     int debounce_ms;           // 去抖时间，默认 25ms
     int long_press_ms;         // 长按阈值，默认 800ms
     int repeat_ms;             // 连发周期，默认 150ms
-    uint16_t calibration_idle_delta_mv; // 标定时判定“有键”的最小偏离，默认 80mV
+    uint16_t calibration_idle_delta_mv; // 标定/强制检测偏离阈值，默认160mV（安全下限）
     ad_keys_event_cb_t event_cb;
     void *event_user_ctx;
 } ad_keys_config_t;

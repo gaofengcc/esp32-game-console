@@ -25,7 +25,7 @@
 #define AD_KEYS_DEFAULT_DEBOUNCE_MS 25
 #define AD_KEYS_DEFAULT_LONG_MS 800
 #define AD_KEYS_DEFAULT_REPEAT_MS 150
-#define AD_KEYS_DEFAULT_IDLE_DELTA_MV 80
+#define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
 
 typedef struct {
     uint32_t version;
@@ -48,6 +48,7 @@ typedef struct {
     bool calibrating;
     bool calibration_wait_release;
     uint8_t calibration_index;
+    uint8_t calibration_warned_mask;
     uint16_t centers_mv[AD_KEYS_COUNT];
     uint16_t min_mv[AD_KEYS_COUNT];
     uint16_t max_mv[AD_KEYS_COUNT];
@@ -78,6 +79,16 @@ typedef struct {
 } ad_keys_ctx_t;
 
 static ad_keys_ctx_t s_ctx;
+
+static void calculate_windows_locked(void);
+
+static uint16_t calibration_min_delta_mv(void)
+{
+    uint16_t configured = s_ctx.cfg.calibration_idle_delta_mv;
+    return configured >= AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV
+               ? configured
+               : AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV;
+}
 
 static uint32_t now_ms(void)
 {
@@ -188,8 +199,34 @@ static esp_err_t save_calibration_locked(void)
     return err;
 }
 
+static void discard_calibration_blob(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("adkeys", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(AD_KEYS_TAG, "丢弃非法标定数据失败：打开 NVS 失败(%s)", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_erase_key(nvs, AD_KEYS_NVS_KEY);
+    if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGW(AD_KEYS_TAG, "丢弃非法标定数据失败：擦除 NVS 失败(%s)", esp_err_to_name(err));
+    }
+}
+
 static esp_err_t load_calibration_locked(void)
 {
+    s_ctx.calibration_valid = false;
+    s_ctx.idle_ready = false;
+    s_ctx.idle_mv = 0;
+    s_ctx.idle_samples = 0;
+    memset(s_ctx.centers_mv, 0, sizeof(s_ctx.centers_mv));
+    memset(s_ctx.min_mv, 0, sizeof(s_ctx.min_mv));
+    memset(s_ctx.max_mv, 0, sizeof(s_ctx.max_mv));
+
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("adkeys", NVS_READONLY, &nvs);
     if (err != ESP_OK) {
@@ -202,14 +239,44 @@ static esp_err_t load_calibration_locked(void)
     nvs_close(nvs);
     if (err != ESP_OK || size != sizeof(blob) || blob.version != AD_KEYS_NVS_VERSION) {
         s_ctx.calibration_valid = false;
+        if (err == ESP_OK && size == sizeof(blob)) {
+            ESP_LOGW(AD_KEYS_TAG, "标定数据版本无效(%lu)，丢弃并要求重标", (unsigned long)blob.version);
+            discard_calibration_blob();
+        }
         return err == ESP_OK ? ESP_ERR_INVALID_VERSION : err;
     }
+
+    bool valid = blob.idle_mv > 0 && blob.idle_mv <= 3300;
+    if (!valid) {
+        ESP_LOGW(AD_KEYS_TAG, "标定数据无效：空闲基线 %umV 超出范围，丢弃并要求重标",
+                 blob.idle_mv);
+    }
+    uint16_t min_delta_mv = calibration_min_delta_mv();
+    for (uint8_t i = 0; i < AD_KEYS_COUNT; ++i) {
+        uint16_t center = blob.center_mv[i];
+        uint16_t delta = blob.idle_mv > center ? (uint16_t)(blob.idle_mv - center) : 0;
+        if (center == 0 || center >= blob.idle_mv || delta < min_delta_mv) {
+            ESP_LOGW(AD_KEYS_TAG,
+                     "标定数据无效：K%u中心%umV接近空闲基线%umV（差%umV<最小%umV），丢弃并要求重标",
+                     i + 1U, center, blob.idle_mv, delta, min_delta_mv);
+            valid = false;
+        }
+    }
+    if (!valid) {
+        discard_calibration_blob();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     memcpy(s_ctx.min_mv, blob.min_mv, sizeof(s_ctx.min_mv));
     memcpy(s_ctx.max_mv, blob.max_mv, sizeof(s_ctx.max_mv));
     memcpy(s_ctx.centers_mv, blob.center_mv, sizeof(s_ctx.centers_mv));
-    s_ctx.idle_mv = blob.idle_mv;
-    s_ctx.idle_ready = true;
+    // NVS 中的基线只用于校验历史标定；启动后仍重新取真实高水位，
+    // 避免旧的 3300mV 把当前硬件实际空闲值 3157mV 卡住。
+    s_ctx.idle_mv = 0;
+    s_ctx.idle_samples = 0;
+    s_ctx.idle_ready = false;
     s_ctx.calibration_valid = true;
+    calculate_windows_locked();
     return ESP_OK;
 }
 
@@ -246,6 +313,7 @@ static void start_calibration_locked(void)
     s_ctx.long_sent = false;
     s_ctx.calibration_wait_release = false;
     s_ctx.calibration_index = 0;
+    s_ctx.calibration_warned_mask = 0;
     s_ctx.candidate_key = 0;
     s_ctx.candidate_count = 0;
     s_ctx.candidate_since_ms = 0;
@@ -259,16 +327,30 @@ static void process_calibration(uint16_t voltage_mv, uint32_t tick_ms)
     if (!s_ctx.idle_ready) {
         return;
     }
-    bool active = abs_diff_u16(voltage_mv, s_ctx.idle_mv) >= s_ctx.cfg.calibration_idle_delta_mv;
+    uint16_t min_delta_mv = calibration_min_delta_mv();
+    bool active = (uint32_t)voltage_mv + min_delta_mv <= s_ctx.idle_mv;
     if (s_ctx.calibration_wait_release) {
         if (!active) {
             s_ctx.calibration_wait_release = false;
             s_ctx.candidate_count = 0;
+            s_ctx.calibration_sample_count = 0;
         }
         return;
     }
     if (!active) {
+        uint8_t bit = (uint8_t)(1U << s_ctx.calibration_index);
+        if ((s_ctx.calibration_warned_mask & bit) == 0) {
+            s_ctx.calibration_warned_mask |= bit;
+            uint16_t delta = s_ctx.idle_mv > voltage_mv
+                                 ? (uint16_t)(s_ctx.idle_mv - voltage_mv)
+                                 : 0;
+            ESP_LOGW(AD_KEYS_TAG,
+                     "标定 K%u 样本无效：电压 %umV 接近空闲基线 %umV（差%umV<最小%umV），请按住按键",
+                     s_ctx.calibration_index + 1U, voltage_mv, s_ctx.idle_mv,
+                     delta, min_delta_mv);
+        }
         s_ctx.candidate_count = 0;
+        s_ctx.calibration_sample_count = 0;
         return;
     }
     if (s_ctx.candidate_count == 0 ||
@@ -378,10 +460,11 @@ static void ad_keys_task(void *arg)
             uint16_t filtered = push_and_get_median(voltage);
             uint32_t tick_ms = now_ms();
             if (!s_ctx.idle_ready && s_ctx.idle_samples < 20) {
-                s_ctx.idle_accum += filtered;
+                if (filtered > s_ctx.idle_mv) {
+                    s_ctx.idle_mv = filtered;
+                }
                 ++s_ctx.idle_samples;
                 if (s_ctx.idle_samples == 20) {
-                    s_ctx.idle_mv = (uint16_t)(s_ctx.idle_accum / 20U);
                     s_ctx.idle_ready = true;
                     ESP_LOGI(AD_KEYS_TAG, "空闲电压基线: %umV", s_ctx.idle_mv);
                     if (!s_ctx.calibration_valid && !s_ctx.calibrating) {
@@ -389,6 +472,9 @@ static void ad_keys_task(void *arg)
                         start_calibration_locked();
                     }
                 }
+            } else if (filtered > s_ctx.idle_mv) {
+                // 按键按下时电压只会下降，基线只向更高电压方向收敛。
+                s_ctx.idle_mv = filtered;
             }
             if (s_ctx.boot_force_pending) {
                 if (tick_ms >= s_ctx.boot_force_deadline_ms) {
@@ -396,12 +482,16 @@ static void ad_keys_task(void *arg)
                     if (!s_ctx.calibration_valid && !s_ctx.calibrating) {
                         start_calibration_locked();
                     }
-                } else if (s_ctx.idle_ready &&
-                           abs_diff_u16(filtered, s_ctx.idle_mv) >= s_ctx.cfg.calibration_idle_delta_mv) {
-                    if (!s_ctx.calibrating) {
-                        start_calibration_locked();
+                } else {
+                    // 基线尚未就绪时只用 3.3V 作为“是否明显按下”的临时参考；
+                    // 它不写入 idle_mv，也不会替代后续真实高水位采样。
+                    uint16_t reference_mv = s_ctx.idle_ready ? s_ctx.idle_mv : 3300U;
+                    if ((uint32_t)filtered + calibration_min_delta_mv() <= reference_mv) {
+                        if (!s_ctx.calibrating) {
+                            start_calibration_locked();
+                        }
+                        s_ctx.boot_force_pending = false;
                     }
-                    s_ctx.boot_force_pending = false;
                 }
             }
             s_ctx.last_voltage_mv = filtered;
@@ -435,7 +525,7 @@ void ad_keys_config_default(ad_keys_config_t *config)
     config->debounce_ms = AD_KEYS_DEFAULT_DEBOUNCE_MS;
     config->long_press_ms = AD_KEYS_DEFAULT_LONG_MS;
     config->repeat_ms = AD_KEYS_DEFAULT_REPEAT_MS;
-    config->calibration_idle_delta_mv = AD_KEYS_DEFAULT_IDLE_DELTA_MV;
+    config->calibration_idle_delta_mv = AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV;
 }
 
 esp_err_t ad_keys_init(const ad_keys_config_t *config)
@@ -453,7 +543,7 @@ esp_err_t ad_keys_init(const ad_keys_config_t *config)
         if (s_ctx.cfg.long_press_ms <= 0) s_ctx.cfg.long_press_ms = AD_KEYS_DEFAULT_LONG_MS;
         if (s_ctx.cfg.repeat_ms <= 0) s_ctx.cfg.repeat_ms = AD_KEYS_DEFAULT_REPEAT_MS;
         if (s_ctx.cfg.calibration_idle_delta_mv == 0) {
-            s_ctx.cfg.calibration_idle_delta_mv = AD_KEYS_DEFAULT_IDLE_DELTA_MV;
+        s_ctx.cfg.calibration_idle_delta_mv = AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV;
         }
     }
 
@@ -678,13 +768,8 @@ bool ad_keys_boot_force_calibration_check(uint32_t window_ms)
         return false;
     }
     uint32_t deadline = now_ms() + (window_ms ? window_ms : 1500U);
-    // 强制窗口通常在 start() 后立即调用；预置无键电压约为 VCC，
-    // 避免用户从上电瞬间按住按键时把按键电压误当成空闲基线。
-    if (!s_ctx.idle_ready) {
-        s_ctx.idle_mv = 3300;
-        s_ctx.idle_ready = true;
-        s_ctx.idle_samples = 20;
-    }
+    // 基线由采样任务从真实 ADC 数据建立；按键按下时电压下降，不能用固定
+    // 猜值直接标记 idle_ready，否则会把实际空闲电压误判成按键。
     s_ctx.boot_force_pending = true;
     s_ctx.boot_force_deadline_ms = deadline;
     while (now_ms() < deadline) {
