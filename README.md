@@ -49,6 +49,7 @@ git submodule set-url third_party/esp32-lab-bridge \
 - `source/idf/game_ui/game_ui.c` 只负责 LVGL 渲染、按键队列和页面切换。
 - 最高分通过 `snake_config_t` 的 `load_best/save_best` 函数指针抽象：设备端接 NVS namespace `game`、key `high_score`，PC 端接本地文件。
 - 默认棋盘为 `30x18`、每格 `16px`；默认慢速 `260ms/格`、默认穿墙。每吃 5 个食物速度减少 `10ms`，最低 `100ms/格`。
+- 蛇身扭动动画默认振幅为 `3px`（50ms 更新一次）；该数值由用户于 2026-09-26 拍板确定。
 - 实体键映射宏位于 `source/idf/game_ui/game_ui.c`：`GAME_UI_KEY_UP/DOWN/LEFT/RIGHT/PAUSE`，默认对应 K1/K2/K3/K4/K5。
 - 修改棋盘大小：调整 `source/game/snake_logic.h` 中的 `SNAKE_BOARD_WIDTH/HEIGHT`；修改格子像素：调整 `GAME_UI_CELL_PX`，并确保总尺寸仍为 `480x320`。
 
