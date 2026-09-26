@@ -124,20 +124,8 @@ static int game_read_high_score(void)
 
 static const char *game_page_name(void)
 {
-    const snake_state_t *state = game_ui_get_state();
-    if (!state) {
-        return "menu";
-    }
-    if (state->game_over) {
-        return "end";
-    }
-    if (state->paused) {
-        return "paused";
-    }
-    if (state->length == 0U) {
-        return "menu";
-    }
-    return "game";
+    const char *name = game_ui_get_page_name();
+    return name ? name : "select";
 }
 
 static esp_err_t game_diag_status(diag_json_writer_t *writer, void *ctx)
