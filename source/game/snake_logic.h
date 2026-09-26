@@ -26,6 +26,10 @@ extern "C" {
 #define SNAKE_SPEED_MEDIUM_MS 180U
 #define SNAKE_SPEED_FAST_MS 120U
 #define SNAKE_MIN_SPEED_MS 100U
+/* 每吃 1 个果子缩短的步进间隔, 数值越小越快. */
+#ifndef SNAKE_SPEED_PER_FOOD_MS
+#define SNAKE_SPEED_PER_FOOD_MS 8U
+#endif
 
 typedef struct {
     uint8_t x;

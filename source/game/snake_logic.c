@@ -10,8 +10,15 @@ static uint16_t snake_base_speed(const snake_game_t *game)
 
 static void snake_refresh_speed(snake_game_t *game)
 {
-    uint32_t reduction = (game->state.foods_eaten / 5U) * 10U;
-    uint32_t speed = snake_base_speed(game);
+    uint32_t reduction;
+    uint32_t speed;
+
+    if (!game) {
+        return;
+    }
+    /* 每吃一个果子加快一点, 到 SNAKE_MIN_SPEED_MS 封顶. */
+    reduction = game->state.foods_eaten * SNAKE_SPEED_PER_FOOD_MS;
+    speed = snake_base_speed(game);
     if (speed > reduction) {
         speed -= reduction;
     } else {
