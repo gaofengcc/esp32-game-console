@@ -26,6 +26,15 @@
 #define AD_KEYS_DEFAULT_LONG_MS 800
 #define AD_KEYS_DEFAULT_REPEAT_MS 150
 #define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
+#define AD_KEYS_FACTORY_IDLE_MV 3157U
+
+static const uint16_t AD_KEYS_FACTORY_CENTER_MV[AD_KEYS_COUNT] = {
+    0U,    /* K1 左 */
+    460U,  /* K2 上 */
+    980U,  /* K3 下 */
+    1565U, /* K4 右 */
+    2397U, /* K5 确定 */
+};
 #ifndef AD_KEYS_LOG_PERIOD_MS
 #define AD_KEYS_LOG_PERIOD_MS 100U
 #endif
@@ -234,6 +243,20 @@ static void discard_calibration_blob(void)
     }
 }
 
+static void load_factory_calibration_locked(void)
+{
+    memcpy(s_ctx.centers_mv, AD_KEYS_FACTORY_CENTER_MV, sizeof(s_ctx.centers_mv));
+    s_ctx.idle_mv = AD_KEYS_FACTORY_IDLE_MV;
+    s_ctx.idle_samples = 0;
+    s_ctx.idle_ready = true;
+    s_ctx.calibration_valid = true;
+    calculate_windows_locked();
+    ESP_LOGI(AD_KEYS_TAG,
+             "使用出厂标定（实测值）：K1=%u K2=%u K3=%u K4=%u K5=%umV，空闲=%umV",
+             s_ctx.centers_mv[0], s_ctx.centers_mv[1], s_ctx.centers_mv[2],
+             s_ctx.centers_mv[3], s_ctx.centers_mv[4], s_ctx.idle_mv);
+}
+
 static esp_err_t load_calibration_locked(void)
 {
     s_ctx.calibration_valid = false;
@@ -247,41 +270,48 @@ static esp_err_t load_calibration_locked(void)
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("adkeys", NVS_READONLY, &nvs);
     if (err != ESP_OK) {
-        s_ctx.calibration_valid = false;
-        return err;
+        load_factory_calibration_locked();
+        return ESP_OK;
     }
     ad_keys_nvs_blob_t blob = {0};
     size_t size = sizeof(blob);
     err = nvs_get_blob(nvs, AD_KEYS_NVS_KEY, &blob, &size);
     nvs_close(nvs);
     if (err != ESP_OK || size != sizeof(blob) || blob.version != AD_KEYS_NVS_VERSION) {
-        s_ctx.calibration_valid = false;
-        if (err == ESP_OK && size == sizeof(blob)) {
-            ESP_LOGW(AD_KEYS_TAG, "标定数据版本无效(%lu)，丢弃并要求重标", (unsigned long)blob.version);
+        if (err == ESP_OK) {
+            if (size == sizeof(blob)) {
+                ESP_LOGW(AD_KEYS_TAG, "标定数据版本无效(%lu)，丢弃并回落到出厂标定",
+                         (unsigned long)blob.version);
+            } else {
+                ESP_LOGW(AD_KEYS_TAG, "标定数据长度无效(%u)，丢弃并回落到出厂标定",
+                         (unsigned)size);
+            }
             discard_calibration_blob();
         }
-        return err == ESP_OK ? ESP_ERR_INVALID_VERSION : err;
+        load_factory_calibration_locked();
+        return ESP_OK;
     }
 
     bool valid = blob.idle_mv > 0 && blob.idle_mv <= 3300;
     if (!valid) {
-        ESP_LOGW(AD_KEYS_TAG, "标定数据无效：空闲基线 %umV 超出范围，丢弃并要求重标",
+        ESP_LOGW(AD_KEYS_TAG, "标定数据无效：空闲基线 %umV 超出范围，丢弃并回落到出厂标定",
                  blob.idle_mv);
     }
     uint16_t min_delta_mv = calibration_min_delta_mv();
     for (uint8_t i = 0; i < AD_KEYS_COUNT; ++i) {
         uint16_t center = blob.center_mv[i];
         uint16_t delta = blob.idle_mv > center ? (uint16_t)(blob.idle_mv - center) : 0;
-        if (center == 0 || center >= blob.idle_mv || delta < min_delta_mv) {
+        if ((i > 0 && center == 0) || center >= blob.idle_mv || delta < min_delta_mv) {
             ESP_LOGW(AD_KEYS_TAG,
-                     "标定数据无效：K%u中心%umV接近空闲基线%umV（差%umV<最小%umV），丢弃并要求重标",
+                     "标定数据无效：K%u中心%umV接近空闲基线%umV（差%umV<最小%umV），丢弃并回落到出厂标定",
                      i + 1U, center, blob.idle_mv, delta, min_delta_mv);
             valid = false;
         }
     }
     if (!valid) {
         discard_calibration_blob();
-        return ESP_ERR_INVALID_RESPONSE;
+        load_factory_calibration_locked();
+        return ESP_OK;
     }
 
     memcpy(s_ctx.min_mv, blob.min_mv, sizeof(s_ctx.min_mv));
