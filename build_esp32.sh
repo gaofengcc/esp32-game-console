@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ESP32-S3 游戏机 P1 构建与发布脚本。
-# 仅生成 bootloader、partition-table、factory app，以及不含 otadata 的 merged bin。
+# 生成双 OTA 所需的分散镜像和 flash_args；不生成整包 merged bin。
 
 set -euo pipefail
 
@@ -16,7 +16,6 @@ SDKCONFIG="${SDKCONFIG:-${PROJECT_DIR}/sdkconfig}"
 IDF_TARGET="${IDF_TARGET:-esp32s3}"
 APP_NAME="${APP_NAME:-esp32_game_console}"
 APP_BIN="${APP_BIN:-${APP_NAME}.bin}"
-MERGED_BIN="${MERGED_BIN:-${APP_NAME}_merged.bin}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
 LOCAL_TOOLCHAIN_FILE="${LOCAL_TOOLCHAIN_FILE:-${PROJECT_DIR}/tools/toolchain-esp32s3.cmake}"
 
@@ -112,8 +111,10 @@ idf.py -B "${BUILD_DIR}" -DSDKCONFIG="${SDKCONFIG}" \
 
 BOOTLOADER_BIN="${BUILD_DIR}/bootloader/bootloader.bin"
 PARTITION_BIN="${BUILD_DIR}/partition_table/partition-table.bin"
+OTA_DATA_BIN="${BUILD_DIR}/ota_data_initial.bin"
+FLASH_ARGS="${BUILD_DIR}/flash_args"
 APP_PATH="${BUILD_DIR}/${APP_BIN}"
-for required in "${BOOTLOADER_BIN}" "${PARTITION_BIN}" "${APP_PATH}"; do
+for required in "${BOOTLOADER_BIN}" "${PARTITION_BIN}" "${OTA_DATA_BIN}" "${APP_PATH}" "${FLASH_ARGS}"; do
     if [[ ! -f "${required}" ]]; then
         echo -e "${RED}构建产物缺失：${required}${NC}" >&2
         exit 1
@@ -123,34 +124,14 @@ done
 mkdir -p "${OUTPUT_DIR}"
 cp "${BOOTLOADER_BIN}" "${OUTPUT_DIR}/bootloader.bin"
 cp "${PARTITION_BIN}" "${OUTPUT_DIR}/partition-table.bin"
+cp "${OTA_DATA_BIN}" "${OUTPUT_DIR}/ota_data_initial.bin"
 cp "${APP_PATH}" "${OUTPUT_DIR}/${APP_BIN}"
-if [[ -f "${BUILD_DIR}/flash_args" ]]; then
-    cp "${BUILD_DIR}/flash_args" "${OUTPUT_DIR}/flash_args"
-fi
+cp "${FLASH_ARGS}" "${OUTPUT_DIR}/flash_args"
 if [[ -f "${BUILD_DIR}/flasher_args.json" ]]; then
     cp "${BUILD_DIR}/flasher_args.json" "${OUTPUT_DIR}/flasher_args.json"
 fi
 
-MERGED_PATH="${OUTPUT_DIR}/${MERGED_BIN}"
-echo -e "${YELLOW}合并 bootloader + partition-table + factory app（不包含 otadata）...${NC}"
-# ESP-IDF v5.3.5 自带 esptool v4.x 使用下划线命令名 merge_bin。
-python -m esptool --chip "${IDF_TARGET}" merge_bin \
-    --flash_mode dio \
-    --flash_freq 80m \
-    --flash_size 16MB \
-    --output "${MERGED_PATH}" \
-    0x0 "${BOOTLOADER_BIN}" \
-    0x8000 "${PARTITION_BIN}" \
-    0x10000 "${APP_PATH}"
-
-# NVS 起始于 0x500000；merged-bin 若覆盖到这里，烧录会以 0xFF 擦掉 NVS。
-MERGED_SIZE="$(stat -c '%s' "${MERGED_PATH}")"
-if (( MERGED_SIZE >= 0x500000 )); then
-    echo -e "${RED}merged bin 大小 ${MERGED_SIZE} >= NVS 起始地址 0x500000，拒绝发布。${NC}" >&2
-    exit 1
-fi
-
-export OUTPUT_DIR MERGED_PATH APP_BIN MERGED_BIN
+export OUTPUT_DIR APP_BIN
 python - <<'PY'
 import hashlib
 import json
@@ -158,10 +139,14 @@ import os
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
-merged_path = Path(os.environ["MERGED_PATH"])
 app_name = os.environ["APP_BIN"]
-merged_name = os.environ["MERGED_BIN"]
-names = ["bootloader.bin", "partition-table.bin", app_name, merged_name]
+names = [
+    "bootloader.bin",
+    "partition-table.bin",
+    "ota_data_initial.bin",
+    app_name,
+    "flash_args",
+]
 artifacts = []
 for name in names:
     path = output_dir / name
@@ -175,7 +160,11 @@ for name in names:
         "sha256": hashlib.sha256(data).hexdigest(),
     })
 (output_dir / "manifest.json").write_text(
-    json.dumps({"artifacts": artifacts}, ensure_ascii=False, indent=2) + "\n",
+    json.dumps({
+        "format": "esp32-game-console-artifacts-v1",
+        "artifacts": artifacts,
+        "ota_app": next((item for item in artifacts if item["name"] == app_name), None),
+    }, ensure_ascii=False, indent=2) + "\n",
     encoding="utf-8",
 )
 for item in artifacts:
@@ -186,4 +175,4 @@ for item in artifacts:
 PY
 
 echo -e "${GREEN}构建完成，发布目录：${OUTPUT_DIR}${NC}"
-echo -e "${GREEN}单文件烧录包：${MERGED_PATH} @ 0x0${NC}"
+echo -e "${GREEN}请使用 output/flash_args 或 idf.py flash 分地址烧录；不生成 merged 整包。${NC}"

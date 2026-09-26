@@ -5,9 +5,14 @@ idf_component_register(
         "."
     REQUIRES
         ad_keys
+        cjson
+        diag_service
         game_ui
+        game_wifi
         lvgl_port
+        lvgl_screenshot
         nvs_flash
+        ota_update
         esp_system
         freertos
 )
