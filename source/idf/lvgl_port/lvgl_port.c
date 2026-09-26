@@ -20,6 +20,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "lvgl_port";
@@ -49,7 +50,21 @@ typedef struct {
     lvgl_port_work_cb_t cb;
     void *user_data;
     SemaphoreHandle_t done;
+    volatile uint32_t state;
+    void (*timeout_cleanup)(void *user_data);
 } lvgl_port_work_item_t;
+
+enum {
+    LVGL_PORT_WORK_WAITING = 0,
+    LVGL_PORT_WORK_DONE = 1,
+    LVGL_PORT_WORK_TIMED_OUT = 2,
+};
+
+typedef struct {
+    uint8_t *bmp_buf;
+    size_t bmp_len;
+    esp_err_t result;
+} lvgl_port_capture_request_t;
 
 typedef struct {
     uint32_t magic;
@@ -120,6 +135,11 @@ static bool touch_calibration_solve(void);
 static bool touch_solve_3x3(float a[3][3], float b[3], float out[3]);
 static bool touch_read_raw_average(uint16_t *raw_x, uint16_t *raw_y);
 static void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y, int16_t *screen_x, int16_t *screen_y);
+static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data,
+                                          TickType_t timeout_ticks,
+                                          void (*timeout_cleanup)(void *user_data));
+static void lvgl_port_capture_in_lvgl_task(void *user_data);
+static void lvgl_port_capture_cleanup(void *user_data);
 
 /* ----------------------------------------------------------- */
 
@@ -228,6 +248,13 @@ void *lvgl_port_get_indev(void)
 
 esp_err_t lvgl_port_call(lvgl_port_work_cb_t cb, void *user_data)
 {
+    return lvgl_port_call_internal(cb, user_data, portMAX_DELAY, NULL);
+}
+
+static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data,
+                                          TickType_t timeout_ticks,
+                                          void (*timeout_cleanup)(void *user_data))
+{
     if (cb == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -238,29 +265,77 @@ esp_err_t lvgl_port_call(lvgl_port_work_cb_t cb, void *user_data)
     }
 
     if (s_work_queue == NULL) {
+        if (timeout_cleanup) {
+            timeout_cleanup(user_data);
+        }
         return ESP_ERR_INVALID_STATE;
+    }
+
+    lvgl_port_work_item_t *item = (lvgl_port_work_item_t *)calloc(1, sizeof(*item));
+    if (item == NULL) {
+        if (timeout_cleanup) {
+            timeout_cleanup(user_data);
+        }
+        return ESP_ERR_NO_MEM;
     }
 
     SemaphoreHandle_t done = xSemaphoreCreateBinary();
     if (done == NULL) {
+        free(item);
+        if (timeout_cleanup) {
+            timeout_cleanup(user_data);
+        }
         return ESP_ERR_NO_MEM;
     }
 
-    lvgl_port_work_item_t item = {
+    *item = (lvgl_port_work_item_t){
         .cb = cb,
         .user_data = user_data,
         .done = done,
+        .state = LVGL_PORT_WORK_WAITING,
+        .timeout_cleanup = timeout_cleanup,
     };
-    lvgl_port_work_item_t *item_ptr = &item;
+    lvgl_port_work_item_t *item_ptr = item;
 
-    if (xQueueSend(s_work_queue, &item_ptr, pdMS_TO_TICKS(1000)) != pdTRUE) {
+    /*
+     * 保留原有队列满时最多等待 1000ms 的语义；截图请求自己的等待上限
+     * 由下面的 done 信号量等待控制。
+     */
+    TickType_t queue_wait = timeout_ticks == portMAX_DELAY
+                                ? pdMS_TO_TICKS(1000)
+                                : timeout_ticks;
+    if (xQueueSend(s_work_queue, &item_ptr, queue_wait) != pdTRUE) {
         vSemaphoreDelete(done);
+        free(item);
+        if (timeout_cleanup) {
+            timeout_cleanup(user_data);
+        }
         return ESP_ERR_TIMEOUT;
     }
 
-    xSemaphoreTake(done, portMAX_DELAY);
-    vSemaphoreDelete(done);
-    return ESP_OK;
+    if (xSemaphoreTake(done, timeout_ticks) == pdTRUE) {
+        /*
+         * LVGL 任务在 Give 之前已将状态置为 DONE，因此此处可以安全
+         * 回收队列项。回调对 user_data 的访问已经结束。
+         */
+        vSemaphoreDelete(done);
+        free(item);
+        return ESP_OK;
+    }
+
+    /*
+     * 超时后不能直接释放 item：它可能仍在队列中，或正在 LVGL 任务中
+     * 执行。用状态转移把释放责任交给“最后完成的一方”，避免 UAF。
+     */
+    uint32_t expected = LVGL_PORT_WORK_WAITING;
+    if (!__atomic_compare_exchange_n(&item->state, &expected,
+                                     LVGL_PORT_WORK_TIMED_OUT, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        /* 回调已完成并发出信号，当前任务取得最终回收权。 */
+        vSemaphoreDelete(done);
+        free(item);
+    }
+    return ESP_ERR_TIMEOUT;
 }
 
 esp_err_t lvgl_port_request_touch_calibration(void)
@@ -810,10 +885,234 @@ static void lvgl_port_process_work_queue(void)
         if (item && item->cb) {
             item->cb(item->user_data);
         }
-        if (item && item->done) {
+        if (!item) {
+            continue;
+        }
+
+        /*
+         * 先发布 DONE，再唤醒等待者。这样等待者拿到信号后，LVGL
+         * 任务不会再访问 item；若等待者已经超时，则由此处负责回收。
+         */
+        uint32_t expected = LVGL_PORT_WORK_WAITING;
+        if (__atomic_compare_exchange_n(&item->state, &expected,
+                                         LVGL_PORT_WORK_DONE, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             xSemaphoreGive(item->done);
+        } else if (expected == LVGL_PORT_WORK_TIMED_OUT) {
+            if (item->timeout_cleanup) {
+                item->timeout_cleanup(item->user_data);
+            }
+            vSemaphoreDelete(item->done);
+            free(item);
         }
     }
+}
+
+/* ===========================================================
+ * 线程安全截图接口
+ * =========================================================== */
+static uint8_t lvgl_port_expand5(uint16_t value)
+{
+    value &= 0x1F;
+    return (uint8_t)((value << 3) | (value >> 2));
+}
+
+static uint8_t lvgl_port_expand6(uint16_t value)
+{
+    value &= 0x3F;
+    return (uint8_t)((value << 2) | (value >> 4));
+}
+
+static void lvgl_port_encode_row_bgr(const uint16_t *src, uint8_t *dst,
+                                     uint32_t width)
+{
+    for (uint32_t x = 0; x < width; ++x) {
+        uint16_t color = src[x];
+        dst[x * 3U + 0U] = lvgl_port_expand5(color);
+        dst[x * 3U + 1U] = lvgl_port_expand6(color >> 5);
+        dst[x * 3U + 2U] = lvgl_port_expand5(color >> 11);
+    }
+}
+
+static void lvgl_port_build_bmp_header(uint8_t *header, uint32_t width,
+                                       uint32_t height, uint32_t pixel_bytes)
+{
+    uint32_t total = 54U + pixel_bytes;
+    memset(header, 0, 54U);
+    header[0] = 'B';
+    header[1] = 'M';
+    header[2] = (uint8_t)total;
+    header[3] = (uint8_t)(total >> 8);
+    header[4] = (uint8_t)(total >> 16);
+    header[5] = (uint8_t)(total >> 24);
+    header[10] = 54U;
+    header[14] = 40U;
+    header[18] = (uint8_t)width;
+    header[19] = (uint8_t)(width >> 8);
+    header[20] = (uint8_t)(width >> 16);
+    header[21] = (uint8_t)(width >> 24);
+    header[22] = (uint8_t)height;
+    header[23] = (uint8_t)(height >> 8);
+    header[24] = (uint8_t)(height >> 16);
+    header[25] = (uint8_t)(height >> 24);
+    header[26] = 1U;
+    header[28] = 24U;
+    header[34] = (uint8_t)pixel_bytes;
+    header[35] = (uint8_t)(pixel_bytes >> 8);
+    header[36] = (uint8_t)(pixel_bytes >> 16);
+    header[37] = (uint8_t)(pixel_bytes >> 24);
+}
+
+static bool lvgl_port_encode_bmp_from_rgb565(const uint8_t *framebuffer,
+                                             uint32_t width, uint32_t height,
+                                             uint32_t stride, uint8_t **bmp_buf,
+                                             size_t *bmp_len)
+{
+    uint32_t row_bytes = width * 3U;
+    uint32_t row_stride = (row_bytes + 3U) & ~3U;
+    uint32_t pixel_bytes = row_stride * height;
+    size_t total = 54U + (size_t)pixel_bytes;
+    uint8_t *bmp = (uint8_t *)malloc(total);
+    if (bmp == NULL) {
+        return false;
+    }
+
+    lvgl_port_build_bmp_header(bmp, width, height, pixel_bytes);
+    uint8_t *pixel_start = bmp + 54U;
+    for (uint32_t y = 0; y < height; ++y) {
+        uint32_t source_y = height - 1U - y;
+        const uint16_t *source_row =
+            (const uint16_t *)(framebuffer + source_y * stride);
+        uint8_t *destination_row = pixel_start + y * row_stride;
+        lvgl_port_encode_row_bgr(source_row, destination_row, width);
+        if (row_stride > row_bytes) {
+            memset(destination_row + row_bytes, 0, row_stride - row_bytes);
+        }
+    }
+
+    *bmp_buf = bmp;
+    *bmp_len = total;
+    return true;
+}
+
+static void lvgl_port_capture_in_lvgl_task(void *user_data)
+{
+    lvgl_port_capture_request_t *request =
+        (lvgl_port_capture_request_t *)user_data;
+    if (request == NULL) {
+        return;
+    }
+
+    request->result = ESP_FAIL;
+    request->bmp_buf = NULL;
+    request->bmp_len = 0;
+
+#if LV_USE_SNAPSHOT
+    lv_display_t *display = lv_display_get_default();
+    lv_obj_t *screen = lv_screen_active();
+    if (display == NULL || screen == NULL) {
+        request->result = ESP_ERR_INVALID_STATE;
+        return;
+    }
+
+    uint32_t width = (uint32_t)lv_display_get_horizontal_resolution(display);
+    uint32_t height = (uint32_t)lv_display_get_vertical_resolution(display);
+    uint32_t stride = lv_draw_buf_width_to_stride(width, LV_COLOR_FORMAT_RGB565);
+    if (stride == 0U) {
+        stride = width * 2U;
+    }
+
+    size_t framebuffer_size = (size_t)stride * height;
+    uint8_t *framebuffer = (uint8_t *)malloc(framebuffer_size);
+    if (framebuffer == NULL) {
+        request->result = ESP_ERR_NO_MEM;
+        return;
+    }
+    memset(framebuffer, 0, framebuffer_size);
+
+    lv_draw_buf_t draw_buf;
+    lv_result_t init_result = lv_draw_buf_init(
+        &draw_buf, width, height, LV_COLOR_FORMAT_RGB565, stride, framebuffer,
+        (uint32_t)framebuffer_size);
+    if (init_result != LV_RESULT_OK) {
+        free(framebuffer);
+        request->result = ESP_FAIL;
+        return;
+    }
+    lv_draw_buf_set_flag(&draw_buf, LV_IMAGE_FLAGS_MODIFIABLE);
+
+    lv_result_t snapshot_result = lv_snapshot_take_to_draw_buf(
+        screen, LV_COLOR_FORMAT_RGB565, &draw_buf);
+    if (snapshot_result != LV_RESULT_OK) {
+        free(framebuffer);
+        request->result = ESP_FAIL;
+        return;
+    }
+
+    bool encoded = lvgl_port_encode_bmp_from_rgb565(
+        framebuffer, draw_buf.header.w, draw_buf.header.h, draw_buf.header.stride,
+        &request->bmp_buf, &request->bmp_len);
+    free(framebuffer);
+    request->result = encoded ? ESP_OK : ESP_ERR_NO_MEM;
+#else
+    request->result = ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+static void lvgl_port_capture_cleanup(void *user_data)
+{
+    lvgl_port_capture_request_t *request =
+        (lvgl_port_capture_request_t *)user_data;
+    if (request == NULL) {
+        return;
+    }
+    free(request->bmp_buf);
+    free(request);
+}
+
+esp_err_t lvgl_port_capture_bmp(uint8_t **bmp_buf, size_t *bmp_len,
+                                uint32_t timeout_ms)
+{
+    if (bmp_buf == NULL || bmp_len == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *bmp_buf = NULL;
+    *bmp_len = 0;
+
+    lvgl_port_capture_request_t *request =
+        (lvgl_port_capture_request_t *)calloc(1, sizeof(*request));
+    if (request == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xTaskGetCurrentTaskHandle() == s_lvgl_task_handle) {
+        /*
+         * LVGL 任务中直接执行，避免向自己的队列投递后自我等待死锁。
+         */
+        lvgl_port_capture_in_lvgl_task(request);
+        esp_err_t result = request->result;
+        *bmp_buf = request->bmp_buf;
+        *bmp_len = request->bmp_len;
+        free(request);
+        return result;
+    }
+
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    if (timeout_ticks == 0 && timeout_ms != 0U) {
+        timeout_ticks = 1;
+    }
+    esp_err_t call_result = lvgl_port_call_internal(
+        lvgl_port_capture_in_lvgl_task, request, timeout_ticks,
+        lvgl_port_capture_cleanup);
+    if (call_result != ESP_OK) {
+        return call_result;
+    }
+
+    esp_err_t capture_result = request->result;
+    *bmp_buf = request->bmp_buf;
+    *bmp_len = request->bmp_len;
+    free(request);
+    return capture_result;
 }
 
 /* ===========================================================

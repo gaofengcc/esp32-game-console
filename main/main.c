@@ -191,14 +191,14 @@ static esp_err_t game_diag_screenshot(uint8_t **bmp_buf, size_t *bmp_len,
     if (!bmp_buf || !bmp_len) {
         return ESP_ERR_INVALID_ARG;
     }
-    /* lvgl_screenshot_capture() 内部使用 lvgl_port_call() 投递到 LVGL 任务。 */
-    return lvgl_screenshot_capture(bmp_buf, bmp_len) ? ESP_OK : ESP_FAIL;
+    /* 诊断 HTTP 任务只投递截图 job；真正的 LVGL 快照在 LVGL 任务中执行。 */
+    return lvgl_port_capture_bmp(bmp_buf, bmp_len, 1500U);
 }
 
 static void game_diag_screenshot_free(uint8_t *bmp_buf, void *ctx)
 {
     (void)ctx;
-    lvgl_screenshot_free(bmp_buf);
+    free(bmp_buf);
 }
 
 static esp_err_t game_send_json(httpd_req_t *req, int status, const char *json)
