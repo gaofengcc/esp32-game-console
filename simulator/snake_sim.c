@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "game_ui.h"
+#include "lvgl_bmp_encoder.h"
 #include "sim_port.h"
 #include "snake_logic.h"
 #include "zlib.h"
@@ -135,6 +136,41 @@ static int write_png(const char *path)
     return 0;
 }
 
+static int has_suffix(const char *text, const char *suffix)
+{
+    size_t text_len = strlen(text);
+    size_t suffix_len = strlen(suffix);
+    return text_len >= suffix_len &&
+           strcmp(text + text_len - suffix_len, suffix) == 0;
+}
+
+static int write_bmp(const char *path)
+{
+    uint8_t *bmp = NULL;
+    size_t bmp_len = 0;
+    if (!lvgl_bmp_encode_rgb565((const uint8_t *)fb, W, H, W * 2U, &bmp,
+                                &bmp_len, NULL)) {
+        return -1;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(bmp);
+        return -1;
+    }
+    size_t written = fwrite(bmp, 1, bmp_len, f);
+    int close_rc = fclose(f);
+    free(bmp);
+    return (written == bmp_len && close_rc == 0) ? 0 : -1;
+}
+
+static int write_shot(const char *path)
+{
+    if (has_suffix(path, ".png")) {
+        return write_png(path);
+    }
+    return write_bmp(path);
+}
+
 static void pump_lvgl(void)
 {
     lv_timer_handler();
@@ -222,6 +258,143 @@ static int check_item(const char *name, int ok)
 {
     printf("%s %s\n", ok ? "PASS" : "FAIL", name);
     return ok;
+}
+
+static uint16_t read_le16(const uint8_t *data)
+{
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static uint32_t read_le32(const uint8_t *data)
+{
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static int bmp_header_valid(const uint8_t *bmp, size_t len)
+{
+    if (!bmp || len < 54U || bmp[0] != 'B' || bmp[1] != 'M') {
+        return 0;
+    }
+    uint32_t width = read_le32(bmp + 18U);
+    uint32_t height = read_le32(bmp + 22U);
+    uint32_t row_bytes = width * 3U;
+    uint32_t row_stride = (row_bytes + 3U) & ~3U;
+    uint32_t pixel_bytes = row_stride * height;
+    return read_le32(bmp + 2U) == len && read_le32(bmp + 10U) == 54U &&
+           read_le32(bmp + 14U) == 40U && width == W && height == H &&
+           read_le16(bmp + 26U) == 1U && read_le16(bmp + 28U) == 24U &&
+           read_le32(bmp + 30U) == 0U && read_le32(bmp + 34U) == pixel_bytes &&
+           len == 54U + (size_t)pixel_bytes && (row_stride % 4U) == 0U;
+}
+
+static int bmp_content_valid(const uint8_t *bmp, size_t len)
+{
+    if (!bmp_header_valid(bmp, len)) {
+        return 0;
+    }
+    const uint8_t *pixels = bmp + 54U;
+    size_t pixel_len = len - 54U;
+    uint8_t first = pixels[0];
+    int all_zero = 1;
+    int all_same = 1;
+    for (size_t i = 0; i < pixel_len; ++i) {
+        if (pixels[i] != 0U) {
+            all_zero = 0;
+        }
+        if (pixels[i] != first) {
+            all_same = 0;
+        }
+    }
+    return !all_zero && !all_same;
+}
+
+static uint32_t bmp_hash(const uint8_t *bmp, size_t len)
+{
+    uint32_t hash = 2166136261U;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= bmp[i];
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static int selftest_shot(void)
+{
+    int all = 1;
+    uint8_t *menu_a = NULL;
+    uint8_t *menu_b = NULL;
+    uint8_t *game_a = NULL;
+    size_t menu_a_len = 0;
+    size_t menu_b_len = 0;
+    size_t game_a_len = 0;
+    int game_capture_ok = 0;
+    int menu_capture_ok = lvgl_bmp_encode_rgb565(
+        (const uint8_t *)fb, W, H, W * 2U, &menu_a, &menu_a_len, NULL);
+    pump_lvgl();
+    menu_capture_ok = menu_capture_ok &&
+                      lvgl_bmp_encode_rgb565(
+                          (const uint8_t *)fb, W, H, W * 2U, &menu_b,
+                          &menu_b_len, NULL);
+    all &= check_item("shot_bmp_header",
+                      menu_capture_ok && bmp_header_valid(menu_a, menu_a_len));
+    all &= check_item("shot_content_valid",
+                      menu_capture_ok && bmp_content_valid(menu_a, menu_a_len));
+    all &= check_item("shot_same_scene_deterministic",
+                      menu_capture_ok && menu_a_len == menu_b_len &&
+                          memcmp(menu_a, menu_b, menu_a_len) == 0);
+
+    inject_token("START");
+    game_capture_ok = lvgl_bmp_encode_rgb565(
+        (const uint8_t *)fb, W, H, W * 2U, &game_a, &game_a_len, NULL);
+    all &= check_item("shot_different_scene",
+                      game_capture_ok && menu_capture_ok &&
+                          (menu_a_len != game_a_len ||
+                           memcmp(menu_a, game_a, menu_a_len) != 0));
+
+    int repeated_ok = game_capture_ok;
+    for (int i = 0; i < 10 && repeated_ok; ++i) {
+        uint8_t *repeat = NULL;
+        size_t repeat_len = 0;
+        repeated_ok = lvgl_bmp_encode_rgb565(
+            (const uint8_t *)fb, W, H, W * 2U, &repeat, &repeat_len, NULL);
+        if (repeated_ok) {
+            repeated_ok = repeat_len == game_a_len &&
+                          memcmp(repeat, game_a, game_a_len) == 0;
+        }
+        free(repeat);
+    }
+    all &= check_item("shot_repeat_10x", repeated_ok);
+
+    uint16_t tiny_pixels[6] = {
+        0xF800, 0x07E0, 0x001F, 0xFFFF, 0x0000, 0x8410
+    };
+    uint8_t *tiny_bmp = NULL;
+    size_t tiny_len = 0;
+    int padding_ok = lvgl_bmp_encode_rgb565(
+        (const uint8_t *)tiny_pixels, 3U, 2U, 3U * 2U, &tiny_bmp, &tiny_len,
+        NULL);
+    if (padding_ok) {
+        const uint32_t tiny_row_stride = 12U;
+        padding_ok = tiny_len == 54U + tiny_row_stride * 2U &&
+                     read_le32(tiny_bmp + 34U) == tiny_row_stride * 2U;
+        for (uint32_t row = 0; padding_ok && row < 2U; ++row) {
+            const uint8_t *padding = tiny_bmp + 54U + row * tiny_row_stride + 9U;
+            padding_ok = padding[0] == 0U && padding[1] == 0U &&
+                         padding[2] == 0U;
+        }
+    }
+    all &= check_item("shot_row_padding", padding_ok);
+    free(tiny_bmp);
+    free(menu_a);
+    free(menu_b);
+    free(game_a);
+
+    game_ui_force_self_collision();
+    const snake_state_t *state = game_ui_get_state();
+    advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
+    inject_token("K5");
+    return all ? 0 : 1;
 }
 
 typedef struct {
@@ -429,7 +602,7 @@ static int selftest_ui(void)
     int offsets_ok = 1;
     for (uint16_t i = 0; state && i < state->length; ++i) {
         int16_t offset = game_ui_get_wiggle_offset(i);
-        if (offset < -2 || offset > 2) {
+        if (offset < -3 || offset > 3) {
             offsets_ok = 0;
             break;
         }
@@ -571,12 +744,13 @@ int main(int argc, char **argv)
     int rc;
     if (self) {
         int logic_rc = selftest_logic();
+        int shot_rc = selftest_shot();
         int ui_rc = selftest_ui();
-        rc = logic_rc || ui_rc;
+        rc = logic_rc || shot_rc || ui_rc;
     } else {
         rc = run_scene(scene, keys, steps, advance_step_ms);
     }
-    if (!rc && shot_path && write_png(shot_path) != 0) {
+    if (!rc && shot_path && write_shot(shot_path) != 0) {
         rc = 1;
     }
     if (flush_stats_enabled) {

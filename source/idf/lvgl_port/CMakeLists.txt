@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "lvgl_port.c"
+        "lvgl_bmp_encoder.c"
         "lv_font_cjk.c"
         "lv_font_cjk_ui.c"
         "game_home.c"

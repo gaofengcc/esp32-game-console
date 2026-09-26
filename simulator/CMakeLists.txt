@@ -11,6 +11,7 @@ set(SIM_COMMON_SRCS
     sim_port.c
     ../source/idf/game_ui/game_ui.c
     ../source/game/snake_logic.c
+    ../source/idf/lvgl_port/lvgl_bmp_encoder.c
     ../source/idf/lvgl_port/lv_font_cjk.c
     ../source/idf/lvgl_port/lv_font_cjk_ui.c)
 add_executable(snake_sim ${SIM_COMMON_SRCS})
