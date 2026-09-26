@@ -26,6 +26,9 @@
 #define AD_KEYS_DEFAULT_LONG_MS 800
 #define AD_KEYS_DEFAULT_REPEAT_MS 150
 #define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
+#ifndef AD_KEYS_RELEASE_HYSTERESIS_MV
+#define AD_KEYS_RELEASE_HYSTERESIS_MV 100U
+#endif
 #define AD_KEYS_FACTORY_IDLE_MV 3157U
 
 static const uint16_t AD_KEYS_FACTORY_CENTER_MV[AD_KEYS_COUNT] = {
@@ -441,6 +444,27 @@ static void process_calibration(uint16_t voltage_mv, uint32_t tick_ms)
 static void process_key(uint16_t voltage_mv, uint32_t tick_ms)
 {
     uint8_t key = s_ctx.calibration_valid ? classify_voltage(voltage_mv) : 0;
+    if (s_ctx.current_key != 0 && s_ctx.calibration_valid) {
+        /*
+         * 迟滞：当前键在原识别窗口外再偏移 100mV 才允许释放。
+         * 跨键滑动时先释放当前键，再按新键的窗口重新确认，避免边界抖动切键。
+         */
+        uint8_t index = (uint8_t)(s_ctx.current_key - 1U);
+        bool released = false;
+        if (s_ctx.min_mv[index] > AD_KEYS_RELEASE_HYSTERESIS_MV &&
+            voltage_mv <= (uint16_t)(s_ctx.min_mv[index] -
+                                     AD_KEYS_RELEASE_HYSTERESIS_MV)) {
+            released = true;
+        }
+        uint32_t release_max = (uint32_t)s_ctx.max_mv[index] +
+                               AD_KEYS_RELEASE_HYSTERESIS_MV;
+        if (release_max < 3300U && voltage_mv >= release_max) {
+            released = true;
+        }
+        if (!released) {
+            key = s_ctx.current_key;
+        }
+    }
     if (key == s_ctx.candidate_key) {
         if (s_ctx.candidate_count < UINT8_MAX) {
             ++s_ctx.candidate_count;
