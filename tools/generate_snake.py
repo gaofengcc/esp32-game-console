@@ -113,8 +113,51 @@ def rounded_rect_at(px: float, py: float, x0: float, y0: float,
 def body_inside(kind: str, x: int, y: int) -> bool:
     vertical = kind.endswith("_up") or kind.endswith("_down")
     return rounded_rect_inside(
-        x, y, 12.0 if vertical else 14.0, 14.0 if vertical else 12.0, 4.0
+        x, y, 12.0 if vertical else 16.0, 16.0 if vertical else 12.0, 4.0
     )
+
+
+def connection_sides(kind: str) -> Tuple[str, ...]:
+    """返回该资源需要和相邻体节无缝相接的边。"""
+    direction_to_side = {
+        "up": "top",
+        "down": "bottom",
+        "left": "left",
+        "right": "right",
+    }
+    if kind.startswith("body_"):
+        if kind.endswith("_up") or kind.endswith("_down"):
+            return ("top", "bottom")
+        return ("left", "right")
+    if kind.startswith("turn_"):
+        return tuple(
+            direction_to_side[direction]
+            for direction in kind.removeprefix("turn_").split("_")
+        )
+    if kind.startswith("tail_"):
+        return (direction_to_side[kind.removeprefix("tail_")],)
+    if kind.startswith("head_"):
+        opposite = {
+            "up": "bottom",
+            "down": "top",
+            "left": "right",
+            "right": "left",
+        }
+        return (opposite[kind.removeprefix("head_")],)
+    return ()
+
+
+def on_connection_side(kind: str, x: int, y: int, side: str) -> bool:
+    """判断像素是否位于指定连接边，供边界描边抑制使用。"""
+    if side == "left":
+        return x == 0
+    if side == "right":
+        return x == WIDTH - 1
+    if side == "top":
+        return y == 0
+    if side == "bottom":
+        return y == HEIGHT - 1
+    raise ValueError(side)
 
 
 def turn_inside(kind: str, x: int, y: int) -> bool:
@@ -137,7 +180,11 @@ def turn_inside(kind: str, x: int, y: int) -> bool:
     horizontal_arm = rounded_rect_at(tx, ty, 5.0, 7.0, 15.0, 15.0, 3.0)
     # 清掉拐角内侧，避免退化为实心方块。
     inner_gap = tx > 8.5 and ty < 7.0
-    return (vertical_arm or horizontal_arm) and not inner_gap
+    # 连接臂贴到 tile 边界，和相邻直线体节/头尾直接相接。
+    top_connection = ty <= 0.5 and 2.5 <= tx <= 9.5
+    right_connection = tx >= 15.5 and 6.0 <= ty <= 14.5
+    return (vertical_arm or horizontal_arm or top_connection or right_connection) \
+        and not inner_gap
 
 
 def tail_inside(kind: str, x: int, y: int) -> Tuple[bool, float]:
@@ -156,11 +203,31 @@ def tail_inside(kind: str, x: int, y: int) -> Tuple[bool, float]:
         return False, axis
     # 末端明显收窄，根部保持接近体节宽度。
     width = 1.4 + 4.8 * (axis / 14.0)
-    return abs(lateral) <= width, axis
+    inside = abs(lateral) <= width
+    # 尾根贴到相邻体节所在的一侧，避免锥形末端与身体之间出现裂缝。
+    if kind == "tail_right" and x == WIDTH - 1:
+        inside = abs(lateral) <= 4.5
+    elif kind == "tail_left" and x == 0:
+        inside = abs(lateral) <= 4.5
+    elif kind == "tail_up" and y == 0:
+        inside = abs(lateral) <= 4.5
+    elif kind == "tail_down" and y == HEIGHT - 1:
+        inside = abs(lateral) <= 4.5
+    return inside, axis
 
 
 def head_inside(kind: str, x: int, y: int) -> bool:
-    return rounded_rect_inside(x, y, 14.0, 14.0, 5.0)
+    inside = rounded_rect_inside(x, y, 14.0, 14.0, 5.0)
+    # 头部后缘贴到身体所在的一侧，保持单对象渲染下的无缝衔接。
+    if kind == "head_right" and x == 0:
+        inside = 4 <= y <= 11
+    elif kind == "head_left" and x == WIDTH - 1:
+        inside = 4 <= y <= 11
+    elif kind == "head_up" and y == HEIGHT - 1:
+        inside = 4 <= x <= 11
+    elif kind == "head_down" and y == 0:
+        inside = 4 <= x <= 11
+    return inside
 
 
 def source_inside(kind: str, x: int, y: int) -> bool:
@@ -180,12 +247,24 @@ def classify_pixel(kind: str, x: int, y: int) -> RGB:
         return BG
 
     # 轮廓：只要相邻像素有一个落在背景，就绘制 1px 深色描边。
-    neighbors = ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
+    if kind.startswith("body_"):
+        # 身体左右边只保留背景留白，不画深色描边；上下边保留描边，
+        # 这样相邻格子的横向拼接不会出现 1px 暗缝。
+        neighbors = ((x, y - 1), (x, y + 1))
+    else:
+        neighbors = ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
     edge = any(
         nx < 0 or nx >= WIDTH or ny < 0 or ny >= HEIGHT
         or not source_inside(kind, nx, ny)
         for nx, ny in neighbors
     )
+    # 连接边直接贴到相邻体节；不画描边，避免格子拼接时出现亮/暗细缝。
+    if any(
+        on_connection_side(kind, x, y, side)
+        for side in connection_sides(kind)
+        if side in ("left", "right")
+    ):
+        edge = False
 
     if kind.startswith("head_"):
         if edge:
