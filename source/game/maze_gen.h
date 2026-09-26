@@ -14,6 +14,7 @@ extern "C" {
 
 #define MAZE_GEN_TRY_MAX 24U
 #define MAZE_GEN_DIFFICULTY_COUNT 10U
+/* 评价支路时认为达到该深度才算“有意义的分叉”。 */
 #define MAZE_GEN_REASONABLE_DEPTH 3U
 
 typedef enum {
@@ -24,6 +25,7 @@ typedef enum {
 } maze_gen_algo_t;
 
 typedef struct {
+    /* 实际地图缓冲区由调用方提供，生成器只写 cells 和出入口。 */
     uint8_t width;
     uint8_t height;
     uint8_t *cells;
@@ -32,6 +34,7 @@ typedef struct {
 } maze_gen_map_t;
 
 typedef struct {
+    /* 入口到候选出口的结构指标，供选出口打分。 */
     uint16_t junctions;
     uint16_t tree_depth;
     uint16_t branches;
@@ -39,11 +42,14 @@ typedef struct {
 } maze_gen_metrics_t;
 
 typedef struct {
+    /* 房间网格尺寸和雕刻算法。 */
     uint8_t rooms_x;
     uint8_t rooms_y;
     maze_gen_algo_t algo;
+    /* Growing Tree 的“取最新点”和“保持直行”概率。 */
     uint8_t newest_pct;
     uint8_t straight_pct;
+    /* 出口至少距离、目标路径长度、最少分叉数。 */
     uint8_t min_path_dist;
     uint8_t target_path;
     uint8_t min_junctions;

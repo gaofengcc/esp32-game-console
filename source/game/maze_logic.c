@@ -14,6 +14,7 @@ static uint32_t maze_random_next(maze_game_t *game)
 
 static bool maze_valid_point(uint8_t x, uint8_t y)
 {
+    /* 公开查询接口统一用固定编译期边界，避免状态被外部写坏后越界。 */
     return (x < MAZE_WIDTH) && (y < MAZE_HEIGHT);
 }
 
@@ -222,6 +223,7 @@ static bool maze_guard_sees_player(const maze_game_t *game)
  */
 static void maze_reset_actors(maze_game_t *game)
 {
+    /* 重置只回收角色和计时，不重新雕地图；重试因此保持本关布局。 */
     game->state.player = game->state.entrance;
     game->state.guard_active = (game->state.mode == MAZE_MODE_CHALLENGE);
     if (game->state.guard_active) {
@@ -358,6 +360,7 @@ static maze_event_t maze_guard_step(maze_game_t *game)
         prefer_dirs[prefer_count] = dir_map[i];
         ++prefer_count;
     }
+    /* 没有可走邻居时仍执行一次抓捕判定，处理守卫与玩家重叠的死路。 */
     if (count == 0U) {
         return maze_apply_catch(game);
     }
@@ -374,6 +377,7 @@ static maze_event_t maze_guard_step(maze_game_t *game)
         pick_dirs = dirs;
         pick_count = count;
     }
+    /* 优先不掉头且不踩出口，其次允许踩出口，最后才允许原地掉头。 */
     pick = (uint8_t)(maze_random_next(game) % pick_count);
     game->state.guard = pick_pts[pick];
     game->state.guard_dir = pick_dirs[pick];
@@ -469,6 +473,7 @@ maze_event_t maze_game_set_input(maze_game_t *game, maze_input_t input)
     maze_dir_delta(maze_input_dir(input), &dx, &dy);
     nx = (int16_t)game->state.player.x + dx;
     ny = (int16_t)game->state.player.y + dy;
+    /* 玩家移动是单格原子操作；撞墙返回 BLOCKED，角色不会被部分更新。 */
     if (!maze_is_path(game, nx, ny)) {
         return MAZE_EVENT_BLOCKED;
     }
@@ -491,6 +496,7 @@ maze_event_t maze_game_advance(maze_game_t *game, uint32_t elapsed_ms)
         return MAZE_EVENT_NONE;
     }
 
+    /* 先扣除倒计时，再推进守卫；超时优先级高于本次守卫移动。 */
     if (game->state.mode == MAZE_MODE_TIMED) {
         if (elapsed_ms >= game->state.remain_ms) {
             game->state.timeout_count++;

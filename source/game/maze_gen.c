@@ -19,7 +19,7 @@ static const maze_gen_diff_t s_diffs[MAZE_GEN_DIFFICULTY_COUNT] = {
     {14U, 8U, MAZE_GEN_ALGO_GROW, 0U, 0U, 48U, 0U, 11U, "Prim"},
 };
 
-/* 生成期工作区: 约 5KB BSS, 避免占用 game_ui 任务栈. 不可重入. */
+/* 生成期工作区: 约 5KB BSS, 避免占用 game_ui 任务栈；不可重入。 */
 static uint16_t s_dist[MAZE_CELL_COUNT];
 static int16_t s_parent[MAZE_CELL_COUNT];
 static uint16_t s_queue[MAZE_CELL_COUNT];
@@ -119,6 +119,7 @@ static uint8_t maze_gen_degree(const maze_gen_map_t *map, uint8_t x, uint8_t y)
  */
 static uint16_t maze_gen_bfs(const maze_gen_map_t *map)
 {
+    /* s_dist/s_parent 是当前入口的一次 BFS 结果，后续候选出口复用。 */
     static const int8_t dx[4] = {0, 0, -1, 1};
     static const int8_t dy[4] = {-1, 1, 0, 0};
     uint16_t i;
@@ -284,6 +285,7 @@ static bool maze_gen_measure_exit(const maze_gen_map_t *map,
     uint16_t i;
     uint16_t marked;
 
+    /* 先标出入口到出口的正解，再统计正解上的分叉及旁支深度。 */
     memset(out, 0, sizeof(*out));
     if (count > MAZE_CELL_COUNT) {
         count = MAZE_CELL_COUNT;

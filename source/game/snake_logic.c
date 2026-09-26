@@ -4,6 +4,7 @@
 
 static uint16_t snake_base_speed(const snake_game_t *game)
 {
+    /* 配置允许传 0，逻辑层统一回落到慢速档。 */
     return game->config.initial_speed_ms ? game->config.initial_speed_ms
                                          : SNAKE_SPEED_SLOW_MS;
 }
@@ -61,6 +62,7 @@ static snake_direction_t snake_input_direction(snake_input_t input)
 
 static uint32_t snake_random_next(snake_game_t *game)
 {
+    /* 与迷宫生成器保持同一 LCG，便于 PC 回放和故障复现。 */
     game->random_state = game->random_state * 1664525U + 1013904223U;
     return game->random_state;
 }
@@ -77,6 +79,7 @@ static bool snake_occupied(const snake_game_t *game, snake_point_t point)
 
 static void snake_spawn_food(snake_game_t *game)
 {
+    /* 从随机起点线性探测，避免在蛇身较长时反复随机撞到占用格。 */
     const uint32_t cells = (uint32_t)game->state.width * game->state.height;
     if (game->state.length >= cells || cells == 0U) {
         game->food_valid = false;
@@ -284,6 +287,7 @@ bool snake_game_step(snake_game_t *game)
             break;
     }
 
+    /* 不吃果子时允许走进“当前尾巴”所在格，因为尾巴本步会前移。 */
     bool ate_food = game->food_valid && snake_same(next, game->state.food);
     uint16_t collision_limit =
         ate_food ? game->state.length
@@ -307,6 +311,7 @@ bool snake_game_step(snake_game_t *game)
     game->state.segments[0] = next;
     game->state.length = new_length;
     if (ate_food) {
+        /* 得分、速度、最高分和下一枚果子在同一个逻辑原子步骤更新。 */
         game->state.score += 10;
         ++game->state.foods_eaten;
         snake_refresh_speed(game);

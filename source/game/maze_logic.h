@@ -14,17 +14,23 @@ extern "C" {
 #endif
 
 #ifndef MAZE_WIDTH
+/* 迷宫逻辑列数；奇数尺寸便于墙/路交替雕刻。 */
 #define MAZE_WIDTH 29U
 #endif
 #ifndef MAZE_HEIGHT
+/* 迷宫逻辑行数。 */
 #define MAZE_HEIGHT 17U
 #endif
 #define MAZE_CELL_COUNT (MAZE_WIDTH * MAZE_HEIGHT)
+/* 闯关模式最多生成的关卡数。 */
 #define MAZE_LEVEL_MAX 30U
 #define MAZE_LEVELS_PER_DIFF 3U
+/* 计时模式每关倒计时上限。 */
 #define MAZE_TIMED_LIMIT_MS 120000U
+/* 闯关守卫的巡逻步进和正前方视线长度。 */
 #define MAZE_GUARD_STEP_MS 480U
 #define MAZE_GUARD_SIGHT 2U
+/* 入口周围的曼哈顿安全半径，玩家出生/被抓回撤时不会被看见。 */
 #define MAZE_ENTRANCE_SAFE_DIST 2U
 
 typedef enum {
@@ -75,25 +81,32 @@ typedef struct {
 } maze_point_t;
 
 typedef struct {
+    /* 地图尺寸和按 y * width + x 排列的墙/路数组。 */
     uint8_t width;
     uint8_t height;
     uint8_t cells[MAZE_CELL_COUNT];
+    /* 入口、出口以及玩家/守卫当前坐标。 */
     maze_point_t entrance;
     maze_point_t exit_cell;
     maze_point_t player;
     maze_point_t guard;
     maze_point_t guard_spawn;
     maze_dir_t guard_dir;
+    /* 仅闯关模式启用守卫；简单/计时模式保持 false。 */
     bool guard_active;
     maze_mode_t mode;
+    /* 从 1 开始的当前关卡；0 表示尚未开始。 */
     uint16_t level;
+    /* 计时模式剩余毫秒，其他模式为 0。 */
     uint32_t remain_ms;
+    /* 诊断计数：被抓回入口和超时重来的次数。 */
     uint32_t caught_count;
     uint32_t timeout_count;
     bool paused;
 } maze_state_t;
 
 typedef struct {
+    /* 当前迷宫状态和生成/守卫巡逻所需的瞬时状态。 */
     maze_state_t state;
     uint32_t random_state;
     uint32_t guard_elapsed_ms;

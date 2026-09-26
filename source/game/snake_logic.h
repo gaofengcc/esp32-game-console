@@ -14,17 +14,22 @@ extern "C" {
 #endif
 
 #ifndef SNAKE_BOARD_WIDTH
+/* 逻辑棋盘列数；UI 以 16px 格子绘制，模拟器和固件共用该值。 */
 #define SNAKE_BOARD_WIDTH 30U
 #endif
 #ifndef SNAKE_BOARD_HEIGHT
+/* 逻辑棋盘行数。 */
 #define SNAKE_BOARD_HEIGHT 18U
 #endif
+/* 蛇身和可放置食物的最大格数，数组按编译期上限分配。 */
 #define SNAKE_MAX_SEGMENTS (SNAKE_BOARD_WIDTH * SNAKE_BOARD_HEIGHT)
 #define SNAKE_MAX_CELLS SNAKE_MAX_SEGMENTS
 
+/* 三档初始速度；实际间隔还会随吃到的果子逐步缩短。 */
 #define SNAKE_SPEED_SLOW_MS 260U
 #define SNAKE_SPEED_MEDIUM_MS 180U
 #define SNAKE_SPEED_FAST_MS 120U
+/* 速度下限，防止高分局步进间隔变成 0。 */
 #define SNAKE_MIN_SPEED_MS 100U
 /* 每吃 1 个果子缩短的步进间隔, 数值越小越快. */
 #ifndef SNAKE_SPEED_PER_FOOD_MS
@@ -32,6 +37,7 @@ extern "C" {
 #endif
 
 typedef struct {
+    /* 坐标以左上角为原点，范围由 snake_state_t.width/height 限定。 */
     uint8_t x;
     uint8_t y;
 } snake_point_t;
@@ -77,20 +83,26 @@ typedef int (*snake_score_load_fn)(void *ctx, int *score);
 typedef int (*snake_score_save_fn)(void *ctx, int score);
 
 typedef struct {
+    /* 实例允许的棋盘尺寸和初始步进间隔。 */
     uint8_t width;
     uint8_t height;
     uint16_t initial_speed_ms;
+    /* true 时越过边界从另一侧出现，false 时撞墙结束。 */
     bool wrap_walls;
+    /* 最高分持久化回调；可为空表示只保存在内存。 */
     snake_score_load_fn load_best;
     snake_score_save_fn save_best;
     void *storage_ctx;
 } snake_config_t;
 
 typedef struct {
+    /* 当前有效棋盘尺寸，通常来自 snake_config_t。 */
     uint8_t width;
     uint8_t height;
+    /* segments[0] 为蛇头，其余元素按头到尾排列。 */
     snake_point_t segments[SNAKE_MAX_SEGMENTS];
     uint16_t length;
+    /* food_valid 位于 snake_game_t；这里保留最近一次食物坐标。 */
     snake_point_t food;
     int score;
     int best_score;
@@ -98,17 +110,23 @@ typedef struct {
     bool wrap_walls;
     bool game_over;
     bool paused;
+    /* 吃果子总数，用于加速和诊断。 */
     uint32_t foods_eaten;
     snake_game_over_reason_t game_over_reason;
 } snake_state_t;
 
 typedef struct {
+    /* 对局公开状态和启动配置。 */
     snake_state_t state;
     snake_config_t config;
+    /* 当前已生效方向，以及下一步允许切换到的方向。 */
     snake_direction_t direction;
     snake_direction_t pending_direction;
+    /* 距离下一格移动累计的毫秒数。 */
     uint32_t elapsed_ms;
+    /* 线性同余随机数种子，保证设备/模拟器可复现。 */
     uint32_t random_state;
+    /* 棋盘未满时为 true；满盘后食物无效。 */
     bool food_valid;
 } snake_game_t;
 
