@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -34,11 +35,14 @@ static const char *TAG = "game_wifi";
 #endif
 
 #define GAME_WIFI_RECONNECT_BIT   BIT0
+/* 断线重连采用指数退避，避免 AP 不可用时持续占满事件任务。 */
 #define GAME_WIFI_RECONNECT_BASE_MS 1000U
 #define GAME_WIFI_RECONNECT_MAX_MS 30000U
+/* 重连任务只等待事件，不直接处理业务 UI。 */
 #define GAME_WIFI_RECONNECT_STACK 3072U
 #define GAME_WIFI_RECONNECT_PRIO  (tskIDLE_PRIORITY + 2)
 
+/* 这些状态由 ESP-IDF 事件任务和重连任务共同读取，更新保持简短。 */
 static esp_netif_t *s_sta_netif;
 static EventGroupHandle_t s_events;
 static TaskHandle_t s_reconnect_task;
@@ -49,6 +53,12 @@ static volatile bool s_started;
 static volatile bool s_connected;
 static volatile uint32_t s_retry_count;
 
+/**
+ * @brief 根据失败次数计算下一次重连延时。
+ *
+ * retry_count 从 1 开始；延时最大封顶 30 秒，防止整数溢出和长时间
+ * 阻塞事件通知。
+ */
 static uint32_t reconnect_delay_ms(uint32_t retry_count)
 {
     uint32_t delay_ms = GAME_WIFI_RECONNECT_BASE_MS;
@@ -81,8 +91,13 @@ static void game_wifi_reconnect_task(void *arg)
 
         uint32_t retry = s_retry_count;
         uint32_t delay_ms = reconnect_delay_ms(retry);
-        ESP_LOGI(TAG, "WiFi 断线，将在 %lu ms 后重连（第 %lu 次）",
-                 (unsigned long)delay_ms, (unsigned long)retry);
+        if (retry <= 1U || (retry % 5U) == 0U) {
+            ESP_LOGI(TAG, "WiFi 断线，将在 %lu ms 后重连（第 %lu 次）",
+                     (unsigned long)delay_ms, (unsigned long)retry);
+        } else {
+            ESP_LOGD(TAG, "WiFi 断线重连退避：%lu ms（第 %lu 次）",
+                     (unsigned long)delay_ms, (unsigned long)retry);
+        }
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
 
         if (!s_started || s_connected) {
@@ -93,6 +108,13 @@ static void game_wifi_reconnect_task(void *arg)
         if (err != ESP_OK && err != ESP_ERR_WIFI_STATE &&
             err != ESP_ERR_WIFI_CONN) {
             ESP_LOGW(TAG, "esp_wifi_connect 失败: %s", esp_err_to_name(err));
+        } else if ((retry % 5U) == 0U) {
+            /* 网络长期不可用时只每 5 次记录一次任务资源，避免刷屏。 */
+            ESP_LOGI(TAG, "重连任务状态：retry=%lu stack_free=%u heap=%u",
+                     (unsigned long)retry,
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                                       MALLOC_CAP_8BIT));
         }
     }
 }
@@ -106,7 +128,11 @@ static void game_wifi_event_handler(void *arg,
 
     if (event_base == WIFI_EVENT) {
         if (event_id == WIFI_EVENT_STA_START) {
-            (void)esp_wifi_set_ps(WIFI_PS_NONE);
+            esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+            if (ps_err != ESP_OK) {
+                ESP_LOGW(TAG, "关闭 WiFi 省电模式失败: %s",
+                         esp_err_to_name(ps_err));
+            }
             ESP_LOGI(TAG, "STA 已启动，开始连接（配置来源：编译期 CONFIG_USER_WIFI_*）");
             esp_err_t err = esp_wifi_connect();
             if (err != ESP_OK && err != ESP_ERR_WIFI_STATE &&
@@ -118,6 +144,22 @@ static void game_wifi_event_handler(void *arg,
             s_connected = false;
             s_ip4[0] = '\0';
             s_retry_count++;
+            const wifi_event_sta_disconnected_t *event =
+                (const wifi_event_sta_disconnected_t *)event_data;
+            if (s_retry_count <= 1U || (s_retry_count % 5U) == 0U) {
+                if (event != NULL) {
+                    ESP_LOGW(TAG, "WiFi 断开：reason=%u，累计重试=%lu",
+                             (unsigned)event->reason,
+                             (unsigned long)s_retry_count);
+                } else {
+                    ESP_LOGW(TAG, "WiFi 断开：无 reason，累计重试=%lu",
+                             (unsigned long)s_retry_count);
+                }
+            } else {
+                ESP_LOGD(TAG, "WiFi 断开（第 %lu 次，reason=%u）",
+                         (unsigned long)s_retry_count,
+                         event ? (unsigned)event->reason : 0U);
+            }
             xEventGroupSetBits(s_events, GAME_WIFI_RECONNECT_BIT);
         }
         return;
@@ -126,10 +168,11 @@ static void game_wifi_event_handler(void *arg,
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
         snprintf(s_ip4, sizeof(s_ip4), IPSTR, IP2STR(&event->ip_info.ip));
+        uint32_t retry_count = s_retry_count;
         s_retry_count = 0;
         s_connected = true;
-        ESP_LOGI(TAG, "WiFi 已连接，IP=%s（配置来源：编译期 CONFIG_USER_WIFI_*）",
-                 s_ip4);
+        ESP_LOGI(TAG, "WiFi 已连接，IP=%s，重试次数=%lu（配置来源：编译期 CONFIG_USER_WIFI_*）",
+                 s_ip4, (unsigned long)retry_count);
         if (s_ip_callback != NULL) {
             s_ip_callback(s_ip4, s_ip_callback_ctx);
         }
@@ -173,6 +216,9 @@ esp_err_t game_wifi_start(void)
         ESP_LOGW(TAG, "未配置 CONFIG_USER_WIFI_SSID，跳过 WiFi STA 启动");
         return ESP_OK;
     }
+    ESP_LOGI(TAG, "准备启动 WiFi STA：SSID 已配置（长度=%u），密码=%s",
+             (unsigned)(sizeof(CONFIG_USER_WIFI_SSID) - 1U),
+             CONFIG_USER_WIFI_PASSWORD[0] != '\0' ? "已配置" : "未配置");
 
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -218,6 +264,11 @@ esp_err_t game_wifi_start(void)
         s_events = NULL;
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(TAG, "WiFi 重连任务已创建：stack=%u words，priority=%u，internal_free=%u",
+             (unsigned)GAME_WIFI_RECONNECT_STACK,
+             (unsigned)GAME_WIFI_RECONNECT_PRIO,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                               MALLOC_CAP_8BIT));
 
     wifi_config_t wifi_config = {0};
     strncpy((char *)wifi_config.sta.ssid, CONFIG_USER_WIFI_SSID,
@@ -245,7 +296,8 @@ esp_err_t game_wifi_start(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "WiFi STA 启动请求已提交（配置来源：编译期 CONFIG_USER_WIFI_*）");
+    ESP_LOGI(TAG, "WiFi STA 启动请求已提交（配置来源：编译期 CONFIG_USER_WIFI_*，"
+             "省电模式=关闭）");
     return ESP_OK;
 #endif
 }

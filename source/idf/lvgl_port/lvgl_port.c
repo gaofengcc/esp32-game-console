@@ -16,6 +16,7 @@
 #include "board_lcd_pins.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -27,28 +28,29 @@
 
 static const char *TAG = "lvgl_port";
 
-/* Display dimensions */
+/* LCD 物理分辨率；触摸校准和截图都以该逻辑坐标系为准。 */
 #define DISP_H_RES  480
 #define DISP_V_RES  320
 
-/* Draw buffer(s) - 20 lines of framebuffer for better throughput
- * Note: LVGL buffers don't need DMA_ATTR as pixel data is copied
- * through an intermediate DMA buffer in lcd_driver_draw_pixels() */
+/* LVGL 局部刷新缓冲：20 行可减少 SPI 事务次数，同时控制内部 RAM 占用。
+ * 像素会在 lcd_driver_draw_pixels() 中复制到 DMA 缓冲，因此这里不要求
+ * DMA_ATTR。 */
 #define BUF_ROWS    20
 static lv_color_t buf1[DISP_H_RES * BUF_ROWS];
-static lv_color_t buf2[DISP_H_RES * BUF_ROWS];  /* Double buffer */
+static lv_color_t buf2[DISP_H_RES * BUF_ROWS];  /* 双缓冲，允许 LVGL 交替渲染。 */
 
-static lv_display_t *disp = NULL;
-static lv_indev_t  *indev = NULL;
-static QueueHandle_t s_work_queue = NULL;
-static TaskHandle_t s_lvgl_task_handle = NULL;
-static bool s_touch_available = false;
+static lv_display_t *disp = NULL;       /* LVGL 默认显示对象。 */
+static lv_indev_t  *indev = NULL;       /* XPT2046 指针输入对象。 */
+static QueueHandle_t s_work_queue = NULL; /* 非 LVGL 任务的串行工作队列。 */
+static TaskHandle_t s_lvgl_task_handle = NULL; /* 用于判断当前是否已在 LVGL 任务。 */
+static bool s_touch_available = false;  /* 触摸驱动是否成功初始化。 */
 
-/* Deferred UI init callback + completion semaphore */
+/* 延迟首页初始化回调及其完成信号量，保证所有 LVGL 对象在同一任务创建。 */
 static void (*s_deferred_ui_init)(void) = NULL;
 static SemaphoreHandle_t s_ui_done_sem = NULL;
 
 typedef struct {
+    /* 工作项由调用方和 LVGL 任务各持有一个引用，支持超时后安全回收。 */
     lvgl_port_work_cb_t cb;
     void *user_data;
     SemaphoreHandle_t done;
@@ -64,12 +66,14 @@ enum {
 };
 
 typedef struct {
+    /* 截图请求由 HTTP/诊断任务创建，实际渲染和编码在 LVGL 任务中执行。 */
     uint8_t *bmp_buf;
     size_t bmp_len;
     esp_err_t result;
 } lvgl_port_capture_request_t;
 
 typedef struct {
+    /* NVS 中保存屏幕尺寸匹配的仿射变换，尺寸变化时自动判为无效。 */
     uint32_t magic;
     uint16_t version;
     uint16_t width;
@@ -94,11 +98,12 @@ typedef struct {
 #define TOUCH_CAL_VERSION     1
 #define TOUCH_CAL_NVS_NS      "lvgl_port"
 #define TOUCH_CAL_NVS_KEY     "touch_aff"
-#define TOUCH_CAL_POINT_COUNT 4
-#define TOUCH_CAL_MARGIN      28
-#define TOUCH_CAL_MIN_SAMPLES 3
-#define TOUCH_RAW_AVG_SAMPLES 3
+#define TOUCH_CAL_POINT_COUNT 4 /* 四角采样，解两组三元仿射系数。 */
+#define TOUCH_CAL_MARGIN      28 /* 目标点离边缘留出的像素。 */
+#define TOUCH_CAL_MIN_SAMPLES 3  /* 每个点抬起时至少保留的有效 raw 样本。 */
+#define TOUCH_RAW_AVG_SAMPLES 3  /* 每次读取 raw 时的短平均窗口。 */
 
+/* 以下状态只在 LVGL 任务中访问，避免额外的 LVGL 互斥锁。 */
 static lvgl_touch_cal_blob_t s_touch_cal = {0};
 static bool s_touch_cal_valid = false;
 static bool s_touch_cal_auto_pending = false;
@@ -151,7 +156,7 @@ static void lvgl_port_capture_cleanup(void *user_data);
 
 esp_err_t lvgl_port_init(void)
 {
-    /* 1. Init LCD driver */
+    /* 1. 初始化 LCD 驱动；屏幕失败时无法继续创建可用的 LVGL 显示。 */
     lcd_driver_config_t lcd_cfg = {
         .pin_led   = BOARD_LCD_PIN_LED,
         .pin_dc    = BOARD_LCD_PIN_DC,
@@ -168,7 +173,7 @@ esp_err_t lvgl_port_init(void)
         return ret;
     }
 
-    /* 2. Init touch driver */
+    /* 2. 初始化触摸驱动；触摸失败仍允许设备以按键模式启动。 */
     touch_driver_config_t touch_cfg = {
         .pin_irq  = BOARD_TOUCH_PIN_IRQ,
         .pin_cs   = BOARD_TOUCH_PIN_CS,
@@ -181,18 +186,21 @@ esp_err_t lvgl_port_init(void)
         ESP_LOGW(TAG, "Touch driver init failed: %s (continuing without touch)", esp_err_to_name(ret));
     } else {
         s_touch_available = true;
-        if (touch_calibration_load() == ESP_OK) {
-            ESP_LOGI(TAG, "Touch affine calibration loaded");
+        esp_err_t cal_err = touch_calibration_load();
+        if (cal_err == ESP_OK) {
+            ESP_LOGI(TAG, "触摸仿射校准已加载（%ux%u）",
+                     (unsigned)s_touch_cal.width, (unsigned)s_touch_cal.height);
         } else {
             s_touch_cal_auto_pending = true;
-            ESP_LOGW(TAG, "No touch affine calibration found, calibration will start after UI init");
+            ESP_LOGW(TAG, "触摸校准不可用(%s)，首页创建后自动开始四点校准",
+                     esp_err_to_name(cal_err));
         }
     }
 
-    /* 3. Init LVGL core (memory pool, timers, etc.) */
+    /* 3. 初始化 LVGL 核心（内存池、定时器等）。 */
     lv_init();
 
-    /* 4. Create LVGL display */
+    /* 4. 创建 480x320 RGB565 显示对象和局部刷新缓冲。 */
     disp = lv_display_create(DISP_H_RES, DISP_V_RES);
     if (disp == NULL) {
         ESP_LOGE(TAG, "Failed to create LVGL display");
@@ -209,7 +217,7 @@ esp_err_t lvgl_port_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* 5. Register touch input device */
+    /* 5. 注册触摸输入设备；驱动不可用时保持按键/UI 主路径。 */
     if (ret == ESP_OK) {
         indev = lv_indev_create();
         if (indev == NULL) {
@@ -221,23 +229,41 @@ esp_err_t lvgl_port_init(void)
         lv_indev_set_display(indev, disp);
     }
 
-    /* 6. Start LVGL tick timer (1ms) */
+    /* 6. 启动 1ms LVGL tick。 */
     const esp_timer_create_args_t tick_args = {
         .callback = lv_tick_timer_cb,
         .name     = "lv_tick",
     };
     esp_timer_handle_t tick_timer;
-    esp_timer_create(&tick_args, &tick_timer);
-    esp_timer_start_periodic(tick_timer, 1000); /* 1ms = 1000us */
+    ret = esp_timer_create(&tick_args, &tick_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "创建 LVGL tick 定时器失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ret = esp_timer_start_periodic(tick_timer, 1000); /* 1ms = 1000us */
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "启动 LVGL tick 定时器失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    /* 7. Start LVGL task handler task
-     * Priority: tskIDLE_PRIORITY + 2 — high enough for smooth UI,
-     * but low enough to let IDLE task run and feed the watchdog */
-    xTaskCreatePinnedToCore(lv_task_handler_task, "lv_task", 10 * 1024, NULL,
-                            tskIDLE_PRIORITY + 2, NULL, 1);
+    /* 7. 启动 LVGL 任务。固定到核 1，和核 0 的按键/游戏逻辑分离。 */
+    BaseType_t task_err = xTaskCreatePinnedToCore(
+        lv_task_handler_task, "lv_task", 10 * 1024, NULL,
+        tskIDLE_PRIORITY + 2, &s_lvgl_task_handle, 1);
+    if (task_err != pdPASS) {
+        ESP_LOGE(TAG, "创建 LVGL 任务失败: err=%ld",
+                 (long)task_err);
+        return ESP_ERR_NO_MEM;
+    }
 
-    ESP_LOGI(TAG, "LVGL port initialized: %dx%d RGB565, touch=%s",
-             DISP_H_RES, DISP_V_RES, indev ? "yes" : "no");
+    ESP_LOGI(TAG,
+             "LVGL 平台初始化完成：%dx%d RGB565，touch=%s，draw_buf=%u bytes，"
+             "internal_free=%u psram_free=%u",
+             DISP_H_RES, DISP_V_RES, indev ? "yes" : "no",
+             (unsigned)(sizeof(buf1) + sizeof(buf2)),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                               MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     return ESP_OK;
 }
@@ -282,6 +308,7 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
     }
 
     if (s_work_queue == NULL) {
+        ESP_LOGW(TAG, "LVGL 工作队列尚未初始化，拒绝跨任务调用");
         if (timeout_cleanup) {
             timeout_cleanup(user_data);
         }
@@ -290,6 +317,8 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
 
     lvgl_port_work_item_t *item = (lvgl_port_work_item_t *)calloc(1, sizeof(*item));
     if (item == NULL) {
+        ESP_LOGW(TAG, "LVGL 工作项分配失败：free_heap=%u",
+                 (unsigned)esp_get_free_heap_size());
         if (timeout_cleanup) {
             timeout_cleanup(user_data);
         }
@@ -298,6 +327,7 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
 
     SemaphoreHandle_t done = xSemaphoreCreateBinary();
     if (done == NULL) {
+        ESP_LOGW(TAG, "LVGL 工作项信号量创建失败");
         free(item);
         if (timeout_cleanup) {
             timeout_cleanup(user_data);
@@ -323,6 +353,9 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
                                 ? pdMS_TO_TICKS(1000)
                                 : timeout_ticks;
     if (xQueueSend(s_work_queue, &item_ptr, queue_wait) != pdTRUE) {
+        ESP_LOGW(TAG, "LVGL 工作队列发送超时：队列深度=%u wait_ticks=%lu",
+                 (unsigned)uxQueueMessagesWaiting(s_work_queue),
+                 (unsigned long)queue_wait);
         if (timeout_cleanup) {
             timeout_cleanup(user_data);
         }
@@ -355,6 +388,8 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
         }
     }
     lvgl_port_work_release(item);
+    ESP_LOGW(TAG, "LVGL 工作项执行等待超时：timeout_ticks=%lu",
+             (unsigned long)timeout_ticks);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -385,7 +420,9 @@ static void touch_calibration_request_cb(void *user_data)
         *(esp_err_t *)user_data = err;
     }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Touch calibration request failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "触摸校准请求失败: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "已在 LVGL 任务中受理手动触摸校准请求");
     }
 }
 
@@ -498,9 +535,11 @@ static lv_obj_t *touch_calibration_overlay_parent(void)
 static esp_err_t touch_calibration_start_internal(bool automatic)
 {
     if (!s_touch_available) {
+        ESP_LOGW(TAG, "触摸校准启动跳过：触摸驱动不可用");
         return ESP_ERR_INVALID_STATE;
     }
     if (s_touch_cal_active) {
+        ESP_LOGI(TAG, "触摸校准已在进行中，忽略重复请求");
         return ESP_OK;
     }
 
@@ -522,12 +561,15 @@ static esp_err_t touch_calibration_start_internal(bool automatic)
     lv_obj_t *parent = touch_calibration_overlay_parent();
     if (parent == NULL) {
         s_touch_cal_active = false;
+        ESP_LOGW(TAG, "触摸校准启动失败：找不到 LVGL overlay 父对象");
         return ESP_ERR_INVALID_STATE;
     }
 
     s_touch_cal_overlay = lv_obj_create(parent);
     if (s_touch_cal_overlay == NULL) {
         s_touch_cal_active = false;
+        ESP_LOGW(TAG, "触摸校准 overlay 创建失败：free_heap=%u",
+                 (unsigned)esp_get_free_heap_size());
         return ESP_ERR_NO_MEM;
     }
     /* 去掉主题默认 padding/border, 避免 480x320 画布实际盖不全. */
@@ -568,7 +610,9 @@ static esp_err_t touch_calibration_start_internal(bool automatic)
     lv_obj_center(dot);
 
     touch_calibration_show_point();
-    ESP_LOGI(TAG, "Touch calibration started (%s)", automatic ? "auto" : "manual");
+    ESP_LOGI(TAG, "触摸校准开始（%s，目标点=%u，边距=%u）",
+             automatic ? "auto" : "manual",
+             (unsigned)TOUCH_CAL_POINT_COUNT, (unsigned)TOUCH_CAL_MARGIN);
     return ESP_OK;
 }
 
@@ -587,6 +631,10 @@ static void touch_calibration_show_point(void)
     lv_obj_align(s_touch_cal_label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_pos(s_touch_cal_target, target->x - 17, target->y - 17);
     lv_obj_move_to_index(s_touch_cal_target, -1);
+    ESP_LOGI(TAG, "触摸校准目标 %u/%u：screen=(%d,%d)",
+             (unsigned)(s_touch_cal_index + 1),
+             (unsigned)TOUCH_CAL_POINT_COUNT,
+             (int)target->x, (int)target->y);
 }
 
 static void touch_calibration_read_cb(lv_indev_data_t *data)
@@ -623,6 +671,10 @@ static void touch_calibration_read_cb(lv_indev_data_t *data)
                     touch_calibration_show_point();
                 }
             } else {
+                ESP_LOGW(TAG, "触摸校准目标 %u 样本不足(%u<%u)，请重新点击",
+                         (unsigned)(s_touch_cal_index + 1),
+                         (unsigned)s_touch_cal_sample_count,
+                         (unsigned)TOUCH_CAL_MIN_SAMPLES);
                 s_touch_cal_sample_count = 0;
                 s_touch_cal_sum_x = 0;
                 s_touch_cal_sum_y = 0;
@@ -647,7 +699,7 @@ static void touch_calibration_read_cb(lv_indev_data_t *data)
 static void touch_calibration_finish(void)
 {
     if (!touch_calibration_solve()) {
-        ESP_LOGW(TAG, "Touch calibration solve failed, restarting");
+        ESP_LOGW(TAG, "触摸校准仿射求解失败，重新从第一个目标点开始");
         s_touch_cal_index = 0;
         s_touch_cal_sample_count = 0;
         s_touch_cal_sum_x = 0;
@@ -660,10 +712,10 @@ static void touch_calibration_finish(void)
     s_touch_cal_valid = true;
     esp_err_t err = touch_calibration_save();
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Touch calibration save failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "触摸校准保存 NVS 失败: %s", esp_err_to_name(err));
     }
 
-    ESP_LOGI(TAG, "Touch calibration done: ax=%.6f bx=%.6f cx=%.2f ay=%.6f by=%.6f cy=%.2f",
+    ESP_LOGI(TAG, "触摸校准完成：ax=%.6f bx=%.6f cx=%.2f ay=%.6f by=%.6f cy=%.2f",
              s_touch_cal.ax, s_touch_cal.bx, s_touch_cal.cx,
              s_touch_cal.ay, s_touch_cal.by, s_touch_cal.cy);
 
@@ -682,14 +734,17 @@ static esp_err_t touch_calibration_load(void)
     nvs_handle_t handle;
     esp_err_t err = nvs_open(TOUCH_CAL_NVS_NS, NVS_READONLY, &handle);
     if (err != ESP_OK) {
+        ESP_LOGD(TAG, "触摸校准 NVS 命名空间不可用: %s", esp_err_to_name(err));
         return err;
     }
 
-    lvgl_touch_cal_blob_t blob;
+    lvgl_touch_cal_blob_t blob = {0};
     size_t len = sizeof(blob);
     err = nvs_get_blob(handle, TOUCH_CAL_NVS_KEY, &blob, &len);
     nvs_close(handle);
     if (err != ESP_OK) {
+        ESP_LOGD(TAG, "触摸校准 NVS 数据不存在或读取失败: %s",
+                 esp_err_to_name(err));
         return err;
     }
 
@@ -700,6 +755,10 @@ static esp_err_t touch_calibration_load(void)
         blob.height != DISP_V_RES ||
         !isfinite(blob.ax) || !isfinite(blob.bx) || !isfinite(blob.cx) ||
         !isfinite(blob.ay) || !isfinite(blob.by) || !isfinite(blob.cy)) {
+        ESP_LOGW(TAG, "触摸校准 NVS 数据无效：len=%u magic=0x%08lx version=%u size=%ux%u",
+                 (unsigned)len, (unsigned long)blob.magic,
+                 (unsigned)blob.version, (unsigned)blob.width,
+                 (unsigned)blob.height);
         return ESP_ERR_INVALID_CRC;
     }
 
@@ -721,6 +780,10 @@ static esp_err_t touch_calibration_save(void)
         err = nvs_commit(handle);
     }
     nvs_close(handle);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "触摸校准已保存到 NVS（namespace=%s key=%s）",
+                 TOUCH_CAL_NVS_NS, TOUCH_CAL_NVS_KEY);
+    }
     return err;
 }
 
@@ -786,7 +849,7 @@ static bool touch_calibration_solve(void)
         if (ex > max_err) max_err = ex;
         if (ey > max_err) max_err = ey;
     }
-    ESP_LOGI(TAG, "Touch calibration max residual %.1f px", max_err);
+    ESP_LOGI(TAG, "触摸校准最大残差 %.1f px（阈值=80px）", max_err);
     return max_err <= 80.0f;
 }
 
@@ -886,6 +949,7 @@ static void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y, int16_t *scr
  * =========================================================== */
 static void lv_tick_timer_cb(void *arg)
 {
+    (void)arg;
     lv_tick_inc(1);
 }
 
@@ -894,13 +958,18 @@ static void lv_tick_timer_cb(void *arg)
  * =========================================================== */
 static void lv_task_handler_task(void *arg)
 {
+    (void)arg;
     s_lvgl_task_handle = xTaskGetCurrentTaskHandle();
+    uint32_t next_resource_log_ms = 0;
 
-    /* Run one handler cycle to initialize LVGL internals */
+    /* 先跑一次 handler，完成 LVGL 内部定时器/显示状态初始化。 */
     lv_task_handler();
     vTaskDelay(pdMS_TO_TICKS(1));
 
     lvgl_port_process_deferred_ui_init();
+    ESP_LOGI(TAG, "LVGL 任务已启动：core=%d stack_free=%u heap=%u",
+             xPortGetCoreID(), (unsigned)uxTaskGetStackHighWaterMark(NULL),
+             (unsigned)esp_get_free_heap_size());
 
     while (1) {
         lvgl_port_process_deferred_ui_init();
@@ -909,7 +978,20 @@ static void lv_task_handler_task(void *arg)
         lvgl_port_process_work_queue();
         /* 放在工作队列之后, 让 game_ui 先建好页面, 校准层再盖到 top layer. */
         lvgl_port_process_touch_cal_auto_start();
-        /* Yield to IDLE task to prevent watchdog timeout */
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        if ((int32_t)(now_ms - next_resource_log_ms) >= 0) {
+            ESP_LOGI(TAG,
+                     "LVGL 运行状态：stack_free=%u heap=%u internal=%u "
+                     "queue_pending=%u touch_cal=%s",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL),
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL |
+                                                       MALLOC_CAP_8BIT),
+                     s_work_queue ? (unsigned)uxQueueMessagesWaiting(s_work_queue) : 0U,
+                     s_touch_cal_active ? "active" : "idle");
+            next_resource_log_ms = now_ms + 30000U;
+        }
+        /* 每轮让出 1 tick，避免满屏刷新时看门狗超时。 */
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
@@ -951,6 +1033,8 @@ static void lvgl_port_process_touch_cal_auto_start(void)
         s_touch_cal_auto_pending = true;
         ESP_LOGW(TAG, "Auto touch calibration start failed: %s",
                  esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "已受理开机自动触摸校准请求");
     }
 }
 
@@ -1018,6 +1102,7 @@ static void lvgl_port_capture_in_lvgl_task(void *user_data)
     lv_display_t *display = lv_display_get_default();
     lv_obj_t *screen = lv_screen_active();
     if (display == NULL || screen == NULL) {
+        ESP_LOGW(TAG, "截图失败：LVGL display 或 active screen 不存在");
         request->result = ESP_ERR_INVALID_STATE;
         return;
     }
@@ -1030,8 +1115,14 @@ static void lvgl_port_capture_in_lvgl_task(void *user_data)
     }
 
     size_t framebuffer_size = (size_t)stride * height;
+    ESP_LOGI(TAG, "截图开始：%ux%u stride=%u framebuffer=%u bytes",
+             (unsigned)width, (unsigned)height, (unsigned)stride,
+             (unsigned)framebuffer_size);
     uint8_t *framebuffer = (uint8_t *)lvgl_port_alloc_buffer(framebuffer_size);
     if (framebuffer == NULL) {
+        ESP_LOGW(TAG, "截图 framebuffer 分配失败：size=%u free_heap=%u",
+                 (unsigned)framebuffer_size,
+                 (unsigned)esp_get_free_heap_size());
         request->result = ESP_ERR_NO_MEM;
         return;
     }
@@ -1042,6 +1133,8 @@ static void lvgl_port_capture_in_lvgl_task(void *user_data)
         &draw_buf, width, height, LV_COLOR_FORMAT_RGB565, stride, framebuffer,
         (uint32_t)framebuffer_size);
     if (init_result != LV_RESULT_OK) {
+        ESP_LOGW(TAG, "截图 draw buffer 初始化失败: result=%d",
+                 (int)init_result);
         free(framebuffer);
         request->result = ESP_FAIL;
         return;
@@ -1051,6 +1144,7 @@ static void lvgl_port_capture_in_lvgl_task(void *user_data)
     lv_result_t snapshot_result = lv_snapshot_take_to_draw_buf(
         screen, LV_COLOR_FORMAT_RGB565, &draw_buf);
     if (snapshot_result != LV_RESULT_OK) {
+        ESP_LOGW(TAG, "LVGL snapshot 失败: result=%d", (int)snapshot_result);
         free(framebuffer);
         request->result = ESP_FAIL;
         return;
@@ -1061,7 +1155,14 @@ static void lvgl_port_capture_in_lvgl_task(void *user_data)
         &request->bmp_buf, &request->bmp_len, lvgl_port_alloc_buffer);
     free(framebuffer);
     request->result = encoded ? ESP_OK : ESP_ERR_NO_MEM;
+    if (encoded) {
+        ESP_LOGI(TAG, "截图完成：BMP=%u bytes", (unsigned)request->bmp_len);
+    } else {
+        ESP_LOGW(TAG, "BMP 编码失败：free_heap=%u",
+                 (unsigned)esp_get_free_heap_size());
+    }
 #else
+    ESP_LOGW(TAG, "截图不可用：LV_USE_SNAPSHOT 未启用");
     request->result = ESP_ERR_NOT_SUPPORTED;
 #endif
 }
@@ -1081,6 +1182,7 @@ esp_err_t lvgl_port_capture_bmp(uint8_t **bmp_buf, size_t *bmp_len,
                                 uint32_t timeout_ms)
 {
     if (bmp_buf == NULL || bmp_len == NULL) {
+        ESP_LOGW(TAG, "截图请求参数为空");
         return ESP_ERR_INVALID_ARG;
     }
     *bmp_buf = NULL;
@@ -1089,6 +1191,8 @@ esp_err_t lvgl_port_capture_bmp(uint8_t **bmp_buf, size_t *bmp_len,
     lvgl_port_capture_request_t *request =
         (lvgl_port_capture_request_t *)calloc(1, sizeof(*request));
     if (request == NULL) {
+        ESP_LOGW(TAG, "截图请求结构分配失败：free_heap=%u",
+                 (unsigned)esp_get_free_heap_size());
         return ESP_ERR_NO_MEM;
     }
 
@@ -1112,6 +1216,7 @@ esp_err_t lvgl_port_capture_bmp(uint8_t **bmp_buf, size_t *bmp_len,
         lvgl_port_capture_in_lvgl_task, request, timeout_ticks,
         lvgl_port_capture_cleanup);
     if (call_result != ESP_OK) {
+        ESP_LOGW(TAG, "截图工作项未完成: %s", esp_err_to_name(call_result));
         return call_result;
     }
 
@@ -1128,12 +1233,13 @@ esp_err_t lvgl_port_capture_bmp(uint8_t **bmp_buf, size_t *bmp_len,
 esp_err_t lvgl_port_deferred_create_main_screen(void)
 {
     if (s_deferred_ui_init != NULL) {
-        ESP_LOGW(TAG, "UI init already scheduled");
+        ESP_LOGW(TAG, "首页 UI 初始化已排队，拒绝重复请求");
         return ESP_FAIL;
     }
 
     s_ui_done_sem = xSemaphoreCreateBinary();
     if (s_ui_done_sem == NULL) {
+        ESP_LOGW(TAG, "首页 UI 初始化信号量创建失败");
         return ESP_ERR_NO_MEM;
     }
 
@@ -1141,7 +1247,7 @@ esp_err_t lvgl_port_deferred_create_main_screen(void)
 
     /* Wait for the LVGL handler task to complete the init (max 30s) */
     if (xSemaphoreTake(s_ui_done_sem, pdMS_TO_TICKS(30000)) != pdTRUE) {
-        ESP_LOGE(TAG, "UI init timeout (30s)");
+        ESP_LOGE(TAG, "首页 UI 初始化超时（30s）");
         s_deferred_ui_init = NULL;
         vSemaphoreDelete(s_ui_done_sem);
         s_ui_done_sem = NULL;
@@ -1150,5 +1256,6 @@ esp_err_t lvgl_port_deferred_create_main_screen(void)
 
     vSemaphoreDelete(s_ui_done_sem);
     s_ui_done_sem = NULL;
+    ESP_LOGI(TAG, "首页 UI 初始化完成");
     return ESP_OK;
 }

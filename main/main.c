@@ -29,32 +29,71 @@
 #include <string.h>
 
 #ifndef CONFIG_GAME_CONSOLE_ENABLE_WIFI
+/* 允许在未生成 sdkconfig 时仍能编译模拟/最小配置。 */
 #define CONFIG_GAME_CONSOLE_ENABLE_WIFI 0
 #endif
 
 #ifndef CONFIG_GAME_CONSOLE_DIAG_PORT
+/* 诊断 HTTP 服务的默认端口，实际值可由 Kconfig 覆盖。 */
 #define CONFIG_GAME_CONSOLE_DIAG_PORT DIAG_SERVICE_DEFAULT_PORT
 #endif
 
 #ifndef CONFIG_GAME_CONSOLE_DIAG_TOKEN
+/* 空 token 表示运行时生成随机 token，且不会把明文写入日志。 */
 #define CONFIG_GAME_CONSOLE_DIAG_TOKEN ""
 #endif
 
+/* 环形日志只保留最近内容，供诊断服务读取，避免无限增长。 */
 #define GAME_LOG_RING_SIZE 4096U
+/* OTA 请求体上限，防止诊断接口因异常请求消耗过多堆内存。 */
 #define OTA_REQUEST_MAX_LEN 768U
+/* token 包含结尾 NUL；编译期 token 过长时会被安全截断。 */
 #define DIAG_TOKEN_MAX_LEN 65U
 
 static const char *TAG = "game_main";
-static int64_t s_boot_time_us;
-static diag_service_handle_t s_diag_handle;
-static char s_diag_token[DIAG_TOKEN_MAX_LEN];
+static int64_t s_boot_time_us;              /* 启动时间戳，用于 uptime。 */
+static diag_service_handle_t s_diag_handle; /* 诊断 HTTP 服务句柄。 */
+static char s_diag_token[DIAG_TOKEN_MAX_LEN]; /* OTA/诊断 Bearer token，仅内存保存。 */
+/* 保存 app_main 的任务句柄，便于诊断状态报告其栈余量。 */
+static TaskHandle_t s_main_task_handle;
 
-static char s_log_ring[GAME_LOG_RING_SIZE];
-static size_t s_log_head;
-static size_t s_log_count;
+static char s_log_ring[GAME_LOG_RING_SIZE]; /* 最近日志的循环存储区。 */
+static size_t s_log_head;                   /* 下一个写入位置。 */
+static size_t s_log_count;                  /* 当前有效字符数。 */
 static portMUX_TYPE s_log_mux = portMUX_INITIALIZER_UNLOCKED;
-static vprintf_like_t s_log_previous_vprintf;
+static vprintf_like_t s_log_previous_vprintf; /* 安装诊断拦截前的输出函数。 */
 
+/**
+ * @brief 记录启动/运行时资源快照。
+ *
+ * 该函数只在启动阶段和低频心跳中调用，不放进高频 UI 或 ADC 循环；
+ * 除总堆外同时报告内部堆、PSRAM 和当前任务栈高水位，便于定位碎片化
+ * 或任务栈不足问题。
+ */
+static void game_log_runtime_resources(const char *phase)
+{
+    const char *label = phase ? phase : "runtime";
+    size_t free_heap = esp_get_free_heap_size();
+    size_t min_free_heap = esp_get_minimum_free_heap_size();
+    size_t internal_free =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t internal_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    UBaseType_t stack_free = s_main_task_handle
+                                 ? uxTaskGetStackHighWaterMark(s_main_task_handle)
+                                 : uxTaskGetStackHighWaterMark(NULL);
+
+    ESP_LOGI(TAG,
+             "%s: heap_free=%u min_heap=%u internal_free=%u internal_largest=%u "
+             "psram_free=%u main_stack_free=%u tasks=%u",
+             label, (unsigned)free_heap, (unsigned)min_free_heap,
+             (unsigned)internal_free, (unsigned)internal_largest,
+             (unsigned)psram_free, (unsigned)stack_free,
+             (unsigned)uxTaskGetNumberOfTasks());
+}
+
+/* 同时转发串口日志并复制到诊断服务的环形缓冲。 */
 static int game_diag_log_vprintf(const char *format, va_list args)
 {
     va_list copy;
@@ -128,6 +167,7 @@ static const char *game_page_name(void)
     return name ? name : "select";
 }
 
+/* 生成不含凭据的运行状态 JSON，供局域网诊断接口读取。 */
 static esp_err_t game_diag_status(diag_json_writer_t *writer, void *ctx)
 {
     (void)ctx;
@@ -152,6 +192,25 @@ static esp_err_t game_diag_status(diag_json_writer_t *writer, void *ctx)
                                       (uint64_t)esp_get_minimum_free_heap_size());
     }
     if (err == ESP_OK) {
+        err = diag_json_writer_kv_u64(
+            writer, "internal_free_heap",
+            (uint64_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+    if (err == ESP_OK) {
+        err = diag_json_writer_kv_u64(
+            writer, "psram_free_heap",
+            (uint64_t)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    }
+    if (err == ESP_OK) {
+        err = diag_json_writer_kv_u64(
+            writer, "task_count", (uint64_t)uxTaskGetNumberOfTasks());
+    }
+    if (err == ESP_OK && s_main_task_handle != NULL) {
+        err = diag_json_writer_kv_u64(
+            writer, "main_stack_high_water",
+            (uint64_t)uxTaskGetStackHighWaterMark(s_main_task_handle));
+    }
+    if (err == ESP_OK) {
         err = diag_json_writer_kv_i64(writer, "high_score",
                                       (int64_t)game_read_high_score());
     }
@@ -172,6 +231,7 @@ static esp_err_t game_diag_status(diag_json_writer_t *writer, void *ctx)
     return err;
 }
 
+/* 截图请求只负责调用线程安全的 LVGL 快照接口。 */
 static esp_err_t game_diag_screenshot(uint8_t **bmp_buf, size_t *bmp_len,
                                       void *ctx)
 {
@@ -352,6 +412,7 @@ static esp_err_t game_diag_reboot(httpd_req_t *req, void *ctx)
     return err;
 }
 
+/* 获得 IPv4 后启动一次诊断服务；重复回调不会重复监听端口。 */
 static void game_diag_start_for_ip(const char *ip_addr)
 {
     if (!ip_addr || ip_addr[0] == '\0' || diag_service_is_running()) {
@@ -376,6 +437,7 @@ static void game_diag_start_for_ip(const char *ip_addr)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "诊断服务已启动: http://%s:%u", ip_addr,
                  (unsigned)config.port);
+        game_log_runtime_resources("诊断服务启动后");
     } else {
         ESP_LOGW(TAG, "diag_service_start 失败: %s", esp_err_to_name(err));
     }
@@ -402,7 +464,9 @@ static void game_diag_prepare_token(void)
                  "%02x", random_bytes[i]);
     }
     s_diag_token[sizeof(random_bytes) * 2U] = '\0';
-    ESP_LOGI(TAG, "诊断服务随机 token: %s", s_diag_token);
+    /* token 是 Bearer 凭据，日志中只说明生成结果，绝不打印明文。 */
+    ESP_LOGI(TAG, "诊断服务已生成随机 token（长度=%u，不输出明文）",
+             (unsigned)(sizeof(random_bytes) * 2U));
 }
 
 static void game_diag_init(void)
@@ -410,6 +474,7 @@ static void game_diag_init(void)
     s_log_previous_vprintf = esp_log_set_vprintf(game_diag_log_vprintf);
     game_diag_prepare_token();
     ESP_ERROR_CHECK(ota_update_service_init());
+    ESP_LOGI(TAG, "诊断日志环形缓冲已启用，OTA 服务已初始化");
     esp_err_t err = ota_update_boot_guard_init();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "OTA 启动自检未通过: %s", esp_err_to_name(err));
@@ -418,25 +483,34 @@ static void game_diag_init(void)
 
 void app_main(void)
 {
+    s_main_task_handle = xTaskGetCurrentTaskHandle();
     s_boot_time_us = esp_timer_get_time();
+    game_log_runtime_resources("启动入口");
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS 分区需要擦除重建: %s", esp_err_to_name(err));
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    ESP_LOGI(TAG, "NVS 初始化完成");
 
     game_diag_init();
+    game_log_runtime_resources("诊断/OTA 初始化后");
 
     ad_keys_config_t ad_config;
     ad_keys_config_default(&ad_config);
     ESP_ERROR_CHECK(ad_keys_init(&ad_config));
     ESP_ERROR_CHECK(ad_keys_start());
+    ESP_LOGI(TAG, "AD 五键驱动已启动：采样=%dms，中值窗口=%d，稳定样本=%d",
+             ad_config.sample_period_ms, ad_config.median_window,
+             ad_config.stable_samples);
     /* 运行时键值采样已关闭, 不再阻塞等待开机强制标定. */
 
     ESP_ERROR_CHECK(lvgl_port_init());
     ESP_ERROR_CHECK(lvgl_screenshot_init());
     ESP_ERROR_CHECK(game_ui_init());
+    game_log_runtime_resources("LVGL/游戏 UI 初始化后");
 
 #if CONFIG_GAME_CONSOLE_ENABLE_WIFI
     game_wifi_register_ip_callback(game_wifi_ip_callback, NULL);
@@ -447,7 +521,16 @@ void app_main(void)
 
     (void)ota_update_mark_app_valid_after_selftest();
     ESP_LOGI(TAG, "游戏机初始化完成：ILI9488 480x320 + XPT2046 + AD 五键");
+    game_log_runtime_resources("启动完成");
+    uint32_t next_resource_log_ms = 30000U;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        if ((int32_t)(now_ms - next_resource_log_ms) >= 0) {
+            ESP_LOGI(TAG, "运行状态：page=%s wifi=%s",
+                     game_page_name(), game_wifi_is_connected() ? "connected" : "offline");
+            game_log_runtime_resources("运行时心跳");
+            next_resource_log_ms = now_ms + 30000U;
+        }
     }
 }
