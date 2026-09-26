@@ -444,11 +444,7 @@ void app_main(void)
     ad_keys_config_default(&ad_config);
     ESP_ERROR_CHECK(ad_keys_init(&ad_config));
     ESP_ERROR_CHECK(ad_keys_start());
-
-    /* 启动后 1.5 秒内按住任意实体键可强制进入 AD 标定。 */
-    if (ad_keys_boot_force_calibration_check(1500)) {
-        ESP_LOGI(TAG, "检测到开机强制标定按键");
-    }
+    /* 运行时键值采样已关闭, 不再阻塞等待开机强制标定. */
 
     ESP_ERROR_CHECK(lvgl_port_init());
     ESP_ERROR_CHECK(lvgl_screenshot_init());

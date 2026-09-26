@@ -26,13 +26,22 @@
 #define AD_KEYS_DEFAULT_LONG_MS 800
 #define AD_KEYS_DEFAULT_REPEAT_MS 150
 #define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
+/*
+ * 运行时按键采样已关闭: 用户看不到提示, 不知道该按哪一颗.
+ * 识别继续使用 NVS 合法窗口或出厂实测值. 后续由专用页面再打开.
+ */
+#ifndef AD_KEYS_ENABLE_RUNTIME_SAMPLING
+#define AD_KEYS_ENABLE_RUNTIME_SAMPLING 0
+#endif
 #ifndef AD_KEYS_RELEASE_HYSTERESIS_MV
 #define AD_KEYS_RELEASE_HYSTERESIS_MV 100U
 #endif
 #define AD_KEYS_FACTORY_IDLE_MV 3157U
+/* 任意两键中心间距下限, 小于该值视为编号错位/重复采样的脏 NVS. */
+#define AD_KEYS_MIN_CENTER_SPACING_MV 200U
 
 static const uint16_t AD_KEYS_FACTORY_CENTER_MV[AD_KEYS_COUNT] = {
-    0U,    /* K1 左 */
+    0U,    /* K1 左, 0mV 是本机合法键值, 不能当无效电压丢掉 */
     460U,  /* K2 上 */
     980U,  /* K3 下 */
     1565U, /* K4 右 */
@@ -190,6 +199,11 @@ static void emit_event(ad_keys_event_type_t type, uint8_t key, uint16_t voltage,
     }
 }
 
+/**
+ * @brief 按窗口匹配键号, 重叠时取离中心更近的键.
+ *
+ * voltage_mv 为 0 是合法输入 (出厂 K1 中心就是 0mV), 不得提前当空闲丢掉.
+ */
 static uint8_t classify_voltage(uint16_t voltage_mv)
 {
     uint8_t key = 0;
@@ -305,11 +319,25 @@ static esp_err_t load_calibration_locked(void)
     for (uint8_t i = 0; i < AD_KEYS_COUNT; ++i) {
         uint16_t center = blob.center_mv[i];
         uint16_t delta = blob.idle_mv > center ? (uint16_t)(blob.idle_mv - center) : 0;
+        /* i==0 且 center==0 合法, 只有 K2..K5 的 0mV 才视为脏数据. */
         if ((i > 0 && center == 0) || center >= blob.idle_mv || delta < min_delta_mv) {
             ESP_LOGW(AD_KEYS_TAG,
                      "标定数据无效：K%u中心%umV接近空闲基线%umV（差%umV<最小%umV），丢弃并回落到出厂标定",
                      i + 1U, center, blob.idle_mv, delta, min_delta_mv);
             valid = false;
+        }
+    }
+    for (uint8_t i = 0; i < AD_KEYS_COUNT && valid; ++i) {
+        for (uint8_t j = (uint8_t)(i + 1U); j < AD_KEYS_COUNT; ++j) {
+            uint16_t distance = abs_diff_u16(blob.center_mv[i], blob.center_mv[j]);
+            if (distance < AD_KEYS_MIN_CENTER_SPACING_MV) {
+                ESP_LOGW(AD_KEYS_TAG,
+                         "标定数据无效：K%u(%umV) 与 K%u(%umV) 间距 %umV<%umV，丢弃并回落到出厂标定",
+                         i + 1U, blob.center_mv[i], j + 1U, blob.center_mv[j],
+                         distance, AD_KEYS_MIN_CENTER_SPACING_MV);
+                valid = false;
+                break;
+            }
         }
     }
     if (!valid) {
@@ -357,8 +385,14 @@ static void calculate_windows_locked(void)
     }
 }
 
+/**
+ * @brief 进入运行时键值采样. 当前默认关闭, 避免无提示采集错键.
+ *
+ * 上下文: ad_keys 任务或持锁的 API 调用方, 不可在 ISR 调用.
+ */
 static void start_calibration_locked(void)
 {
+#if AD_KEYS_ENABLE_RUNTIME_SAMPLING
     s_ctx.calibrating = true;
     s_ctx.current_key = 0;
     s_ctx.long_sent = false;
@@ -371,6 +405,10 @@ static void start_calibration_locked(void)
     s_ctx.calibration_sample_count = 0;
     memset(s_ctx.centers_mv, 0, sizeof(s_ctx.centers_mv));
     ESP_LOGI(AD_KEYS_TAG, "进入标定模式，请依次按下 K1..K5");
+#else
+    ESP_LOGW(AD_KEYS_TAG,
+             "运行时键值采样已关闭, 继续使用出厂/NVS 窗口, 等待专用采样页");
+#endif
 }
 
 static void process_calibration(uint16_t voltage_mv, uint32_t tick_ms)
@@ -569,15 +607,17 @@ static void ad_keys_task(void *arg)
                 if (s_ctx.idle_samples == 20) {
                     s_ctx.idle_ready = true;
                     ESP_LOGI(AD_KEYS_TAG, "空闲电压基线: %umV", s_ctx.idle_mv);
+#if AD_KEYS_ENABLE_RUNTIME_SAMPLING
                     if (!s_ctx.calibration_valid && !s_ctx.calibrating) {
-                        // NVS 没有标定数据时自动进入首次标定，主应用可据此切换标定页。
                         start_calibration_locked();
                     }
+#endif
                 }
             } else if (filtered > s_ctx.idle_mv) {
                 // 按键按下时电压只会下降，基线只向更高电压方向收敛。
                 s_ctx.idle_mv = filtered;
             }
+#if AD_KEYS_ENABLE_RUNTIME_SAMPLING
             if (s_ctx.boot_force_pending) {
                 if (tick_ms >= s_ctx.boot_force_deadline_ms) {
                     s_ctx.boot_force_pending = false;
@@ -585,8 +625,8 @@ static void ad_keys_task(void *arg)
                         start_calibration_locked();
                     }
                 } else {
-                    // 基线尚未就绪时只用 3.3V 作为“是否明显按下”的临时参考；
-                    // 它不写入 idle_mv，也不会替代后续真实高水位采样。
+                    // 基线尚未就绪时只用 3.3V 作为"是否明显按下"的临时参考;
+                    // 它不写入 idle_mv, 也不会替代后续真实高水位采样.
                     uint16_t reference_mv = s_ctx.idle_ready ? s_ctx.idle_mv : 3300U;
                     if ((uint32_t)filtered + calibration_min_delta_mv() <= reference_mv) {
                         if (!s_ctx.calibrating) {
@@ -596,6 +636,7 @@ static void ad_keys_task(void *arg)
                     }
                 }
             }
+#endif
             s_ctx.last_voltage_mv = filtered;
             s_ctx.last_raw_voltage_mv = voltage;
             if (s_ctx.calibrating) {
@@ -763,6 +804,10 @@ uint8_t ad_keys_get_key(void)
 
 esp_err_t ad_keys_start_calibration(void)
 {
+#if !AD_KEYS_ENABLE_RUNTIME_SAMPLING
+    start_calibration_locked();
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     if (!s_ctx.lock) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -774,6 +819,7 @@ esp_err_t ad_keys_start_calibration(void)
     start_calibration_locked();
     xSemaphoreGive(s_ctx.lock);
     return ESP_OK;
+#endif
 }
 
 esp_err_t ad_keys_request_calibration(void)
@@ -862,6 +908,10 @@ esp_err_t ad_keys_clear_calibration(void)
 
 bool ad_keys_boot_force_calibration_check(uint32_t window_ms)
 {
+#if !AD_KEYS_ENABLE_RUNTIME_SAMPLING
+    (void)window_ms;
+    return false;
+#else
     if (!s_ctx.lock || !s_ctx.running) {
         return false;
     }
@@ -878,6 +928,7 @@ bool ad_keys_boot_force_calibration_check(uint32_t window_ms)
     }
     s_ctx.boot_force_pending = false;
     return s_ctx.calibrating;
+#endif
 }
 
 bool ad_keys_force_calibration_window(uint32_t window_ms)

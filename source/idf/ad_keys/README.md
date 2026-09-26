@@ -2,6 +2,8 @@
 
 本组件针对 ESP32-S3 `GPIO1 / ADC1_CH0` 的单路五键电阻分压模块。
 
+当前 `AD_KEYS_ENABLE_RUNTIME_SAMPLING=0`: 不自动/开机采集键值, 识别走 NVS 合法窗口或出厂实测值. 专用采样页就绪后再打开该宏.
+
 ## 使用流程
 
 ```c

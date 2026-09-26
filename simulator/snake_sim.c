@@ -186,8 +186,11 @@ static void advance_ms(uint32_t elapsed_ms)
 
 static uint8_t parse_key(const char *token)
 {
-    if (!strcmp(token, "K1") || !strcmp(token, "LEFT") ||
-        !strcmp(token, "START") || !strcmp(token, "RETRY")) {
+    if (!strcmp(token, "START") || !strcmp(token, "RETRY") ||
+        !strcmp(token, "OK") || !strcmp(token, "ENTER")) {
+        return 5;
+    }
+    if (!strcmp(token, "K1") || !strcmp(token, "LEFT")) {
         return 1;
     }
     if (!strcmp(token, "K2") || !strcmp(token, "UP")) {
@@ -383,6 +386,8 @@ static int selftest_shot(void)
     game_ui_force_self_collision();
     const snake_state_t *state = game_ui_get_state();
     advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
+    /* 结束页默认选中“再来一次”; 下移到“返回首页”再确认, 回到菜单. */
+    inject_token("DOWN");
     inject_token("K5");
     return all ? 0 : 1;
 }

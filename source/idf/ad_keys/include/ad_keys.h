@@ -68,8 +68,8 @@ esp_err_t ad_keys_get_state(ad_keys_state_t *state);
 uint16_t ad_keys_get_voltage_mv(void);
 uint8_t ad_keys_get_key(void);
 
-// 标定控制。启动后按 K1..K5，组件按采集顺序保存中心电压并自动计算窗口。
-// 完成时会通过回调发送 PRESS 之外的内部标定状态，主应用可轮询 state。
+// 标定控制。当前运行时采样默认关闭, 调用返回 ESP_ERR_NOT_SUPPORTED.
+// 后续专用采样页打开 AD_KEYS_ENABLE_RUNTIME_SAMPLING 后再启用.
 esp_err_t ad_keys_start_calibration(void);
 esp_err_t ad_keys_request_calibration(void);
 bool ad_keys_is_calibrating(void);
@@ -83,8 +83,7 @@ esp_err_t ad_keys_get_calibration_windows(uint16_t min_mv[AD_KEYS_COUNT],
 esp_err_t ad_keys_load_calibration(void);
 esp_err_t ad_keys_clear_calibration(void);
 
-// 开机 1.5 秒强制标定检测：初始化后调用一次，检测窗口内是否有任意稳定按键。
-// 返回 true 表示在限定时间内检测到按键，组件已进入标定模式。
+// 开机强制标定. 运行时采样关闭时立即返回 false, 不阻塞.
 bool ad_keys_boot_force_calibration_check(uint32_t window_ms);
 
 // 兼容主应用命名；等价于 ad_keys_boot_force_calibration_check(1500)。

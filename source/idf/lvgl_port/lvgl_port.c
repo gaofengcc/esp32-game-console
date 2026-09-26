@@ -127,6 +127,8 @@ static void lv_tick_timer_cb(void *arg);
 static void lv_task_handler_task(void *arg);
 static void lvgl_port_process_deferred_ui_init(void);
 static void lvgl_port_process_work_queue(void);
+static void lvgl_port_process_touch_cal_auto_start(void);
+static lv_obj_t *touch_calibration_overlay_parent(void);
 static void touch_calibration_request_cb(void *user_data);
 static esp_err_t touch_calibration_start_internal(bool automatic);
 static void touch_calibration_read_cb(lv_indev_data_t *data);
@@ -467,15 +469,46 @@ static void touch_read_cb(lv_indev_t *indev_drv, lv_indev_data_t *data)
     data->state = LV_INDEV_STATE_RELEASED;
 }
 
+/**
+ * @brief 取触摸校准 overlay 的父对象.
+ *
+ * 必须用 lv_layer_top, 不能挂在 lv_screen_active 上. game_ui 会
+ * lv_screen_load 切换菜单/游戏/结束页, 旧屏上的子对象会一起消失.
+ *
+ * @return 顶层 layer, 不可用时退回当前 screen
+ */
+static lv_obj_t *touch_calibration_overlay_parent(void)
+{
+    lv_obj_t *top = lv_layer_top();
+    if (top != NULL) {
+        return top;
+    }
+    return lv_screen_active();
+}
+
+/**
+ * @brief 创建全屏触摸校准层并开始采集 4 个标定点.
+ *
+ * 仅在 LVGL 任务上下文调用. 已在进行中时直接返回, 避免 game_ui
+ * 再次请求时拆掉正在显示的 overlay.
+ *
+ * @param automatic true 表示开机自动校准, 仅用于日志
+ * @return ESP_OK 或触摸不可用 / 无父对象 / 内存不足
+ */
 static esp_err_t touch_calibration_start_internal(bool automatic)
 {
     if (!s_touch_available) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_touch_cal_active) {
+        return ESP_OK;
+    }
 
     if (s_touch_cal_overlay != NULL) {
         lv_obj_delete(s_touch_cal_overlay);
         s_touch_cal_overlay = NULL;
+        s_touch_cal_target = NULL;
+        s_touch_cal_label = NULL;
     }
 
     memset(s_touch_cal_points, 0, sizeof(s_touch_cal_points));
@@ -486,19 +519,29 @@ static esp_err_t touch_calibration_start_internal(bool automatic)
     s_touch_cal_sum_x = 0;
     s_touch_cal_sum_y = 0;
 
-    s_touch_cal_overlay = lv_obj_create(lv_screen_active());
+    lv_obj_t *parent = touch_calibration_overlay_parent();
+    if (parent == NULL) {
+        s_touch_cal_active = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_touch_cal_overlay = lv_obj_create(parent);
     if (s_touch_cal_overlay == NULL) {
         s_touch_cal_active = false;
         return ESP_ERR_NO_MEM;
     }
-    lv_obj_set_size(s_touch_cal_overlay, DISP_H_RES, DISP_V_RES);
+    /* 去掉主题默认 padding/border, 避免 480x320 画布实际盖不全. */
+    lv_obj_remove_style_all(s_touch_cal_overlay);
+    lv_obj_set_size(s_touch_cal_overlay, LV_PCT(100), LV_PCT(100));
     lv_obj_set_pos(s_touch_cal_overlay, 0, 0);
     lv_obj_set_style_bg_color(s_touch_cal_overlay, lv_color_hex(0x11111B), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_touch_cal_overlay, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_touch_cal_overlay, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_touch_cal_overlay, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_touch_cal_overlay, 0, LV_PART_MAIN);
     lv_obj_clear_flag(s_touch_cal_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_touch_cal_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_to_index(s_touch_cal_overlay, -1);
 
     s_touch_cal_label = lv_label_create(s_touch_cal_overlay);
     lv_obj_set_style_text_color(s_touch_cal_label, lv_color_hex(0xCDD6F4), LV_PART_MAIN);
@@ -864,6 +907,8 @@ static void lv_task_handler_task(void *arg)
         lvgl_port_process_work_queue();
         lv_task_handler();
         lvgl_port_process_work_queue();
+        /* 放在工作队列之后, 让 game_ui 先建好页面, 校准层再盖到 top layer. */
+        lvgl_port_process_touch_cal_auto_start();
         /* Yield to IDLE task to prevent watchdog timeout */
         vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -879,16 +924,33 @@ static void lvgl_port_process_deferred_ui_init(void)
     s_deferred_ui_init = NULL;
     init_cb();
 
-    if (s_touch_cal_auto_pending && s_touch_available && !s_touch_cal_valid) {
-        s_touch_cal_auto_pending = false;
-        esp_err_t err = touch_calibration_start_internal(true);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Auto touch calibration start failed: %s", esp_err_to_name(err));
-        }
-    }
-
     if (s_ui_done_sem != NULL) {
         xSemaphoreGive(s_ui_done_sem);
+    }
+}
+
+/**
+ * @brief 处理开机自动触摸校准.
+ *
+ * 原先只挂在 deferred UI 回调里; 主路径并不调用
+ * lvgl_port_deferred_create_main_screen, 导致 pending 永远不触发.
+ * 现改为 LVGL 任务循环检查, overlay 建在 lv_layer_top.
+ *
+ * 上下文: lv_task, 不可在 ISR 调用.
+ */
+static void lvgl_port_process_touch_cal_auto_start(void)
+{
+    if (!s_touch_cal_auto_pending || !s_touch_available ||
+        s_touch_cal_valid || s_touch_cal_active) {
+        return;
+    }
+
+    s_touch_cal_auto_pending = false;
+    esp_err_t err = touch_calibration_start_internal(true);
+    if (err != ESP_OK) {
+        s_touch_cal_auto_pending = true;
+        ESP_LOGW(TAG, "Auto touch calibration start failed: %s",
+                 esp_err_to_name(err));
     }
 }
 

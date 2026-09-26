@@ -35,7 +35,6 @@ extern const lv_font_t lv_font_cjk_16;
 #define GAME_UI_TICK_MS 20U
 #define GAME_UI_CELL_PX 16U
 #define GAME_UI_STATUS_BAR_PX 32U
-#define GAME_UI_BOARD_CELLS (SNAKE_BOARD_WIDTH * SNAKE_BOARD_HEIGHT)
 
 /* 扭动动画参数：默认 3px（用户 2026-09-26 拍板）、50ms 更新一次，即 20Hz。 */
 #ifndef GAME_UI_WIGGLE_ENABLE
@@ -75,19 +74,13 @@ extern const lv_font_t lv_font_cjk_16;
 #endif
 
 /*
- * 菜单仍保留现有三个直接快捷键，避免扩大 UI 改动面：
- * K1 开始、K2 切换速度、K3 切换穿墙；K5 在结束页返回首页。
- * 游戏页则严格按上面的方向/暂停映射处理。
+ * 菜单/结束页：方向键移动选中项，K5 确认。
+ * 不再给每个按钮绑定不同实体键，避免和游戏内方向键冲突。
  */
-#define GAME_UI_MENU_START_KEY GAME_UI_KEY_LEFT
-#define GAME_UI_MENU_SPEED_KEY GAME_UI_KEY_UP
-#define GAME_UI_MENU_WRAP_KEY GAME_UI_KEY_DOWN
-#define GAME_UI_END_RETRY_KEY GAME_UI_KEY_LEFT
+#define GAME_UI_MENU_ITEM_COUNT 3U
+#define GAME_UI_END_ITEM_COUNT 2U
 
-/* 菜单/状态栏上的键位提示集中定义，后续改键位只需要改这里。 */
-#define GAME_UI_KEY1_TEXT "K1"
-#define GAME_UI_KEY2_TEXT "K2"
-#define GAME_UI_KEY3_TEXT "K3"
+/* 游戏页状态栏仍提示暂停键。 */
 #define GAME_UI_KEY5_TEXT "K5"
 
 #define COLOR_BG 0x0F1720
@@ -100,6 +93,7 @@ extern const lv_font_t lv_font_cjk_16;
 #define COLOR_GRID 0x141E26
 #define COLOR_BUTTON 0x263238
 #define COLOR_BUTTON_PRESSED 0x34545E
+#define COLOR_BUTTON_IDLE 0x1B2830
 #define COLOR_EYE 0x18332B
 
 typedef enum {
@@ -126,14 +120,17 @@ static bool s_touch_calibration_requested;
 /* 所有 LVGL 对象只在 game_ui_port_call 或 LVGL 按钮回调中访问。 */
 static lv_obj_t *s_screen;
 static lv_obj_t *s_menu_title;
+static lv_obj_t *s_menu_buttons[GAME_UI_MENU_ITEM_COUNT];
 static lv_obj_t *s_menu_speed_label;
 static lv_obj_t *s_menu_wrap_label;
 static lv_obj_t *s_menu_high_score;
+static lv_obj_t *s_menu_hint;
+static lv_obj_t *s_end_buttons[GAME_UI_END_ITEM_COUNT];
+static uint8_t s_menu_index;
+static uint8_t s_end_index;
 static lv_obj_t *s_game_screen;
 static lv_obj_t *s_status_bar;
 static lv_obj_t *s_board;
-static lv_obj_t *s_cells[GAME_UI_BOARD_CELLS];
-static uint8_t s_cell_state[GAME_UI_BOARD_CELLS];
 static lv_obj_t *s_snake_images[SNAKE_MAX_SEGMENTS];
 static const lv_image_dsc_t *s_snake_sources[SNAKE_MAX_SEGMENTS];
 static int16_t s_snake_rendered_x[SNAKE_MAX_SEGMENTS];
@@ -155,7 +152,6 @@ static uint8_t s_speed_level = 0;
 static int s_rendered_score = -1;
 static int s_rendered_best_score = -1;
 static bool s_rendered_paused;
-static bool s_board_needs_full_refresh = true;
 static snake_point_t s_rendered_food = {UINT8_MAX, UINT8_MAX};
 static uint32_t s_wiggle_phase_ms;
 static uint32_t s_wiggle_elapsed_ms;
@@ -179,6 +175,44 @@ static const lv_font_t *game_ui_font_body(void)
 static const lv_font_t *game_ui_font_title(void)
 {
     return &s_title_font_with_fallback;
+}
+
+/**
+ * @brief 页面名, 仅用于过程日志.
+ */
+static const char *game_ui_page_name(game_ui_page_t page)
+{
+    switch (page) {
+        case GAME_UI_PAGE_GAME:
+            return "game";
+        case GAME_UI_PAGE_END:
+            return "end";
+        case GAME_UI_PAGE_MENU:
+        default:
+            return "menu";
+    }
+}
+
+/**
+ * @brief 输出当前页面和菜单状态, 方便对照按键后的跳转.
+ */
+static void game_ui_log_page(const char *action)
+{
+    const snake_state_t *state = snake_game_state(&s_game);
+
+    game_ui_port_log_i(TAG,
+                       "%s: page=%s menu=%u end=%u speed=%u wrap=%u "
+                       "score=%d len=%u paused=%u over=%u",
+                       action ? action : "?",
+                       game_ui_page_name(s_page),
+                       (unsigned)s_menu_index,
+                       (unsigned)s_end_index,
+                       (unsigned)s_speed_level,
+                       s_wrap_enabled ? 1U : 0U,
+                       state ? state->score : 0,
+                       state ? (unsigned)state->length : 0U,
+                       (state && state->paused) ? 1U : 0U,
+                       (state && state->game_over) ? 1U : 0U);
 }
 
 static int game_ui_load_best(void *ctx, int *score)
@@ -245,6 +279,91 @@ static lv_obj_t *game_ui_make_button(lv_obj_t *parent, const char *text,
     return button;
 }
 
+/**
+ * @brief 刷新按钮选中态, 未选中用弱边框.
+ */
+static void game_ui_set_button_focus(lv_obj_t *button, bool focused)
+{
+    if (!button) {
+        return;
+    }
+    lv_obj_set_style_border_width(button, focused ? 3 : 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(
+        button, lv_color_hex(focused ? COLOR_ACCENT : COLOR_BUTTON_IDLE),
+        LV_PART_MAIN);
+    lv_obj_set_style_bg_color(
+        button, lv_color_hex(focused ? COLOR_BUTTON_PRESSED : COLOR_BUTTON),
+        LV_PART_MAIN);
+}
+
+/**
+ * @brief 在环形列表上移动选中下标.
+ */
+static void game_ui_move_index(uint8_t *index, uint8_t count, int8_t delta)
+{
+    int32_t next;
+
+    if (!index || count == 0U) {
+        return;
+    }
+    next = (int32_t)(*index) + (int32_t)delta;
+    if (next < 0) {
+        next = (int32_t)count - 1;
+    } else if (next >= (int32_t)count) {
+        next = 0;
+    }
+    *index = (uint8_t)next;
+}
+
+static void game_ui_refresh_menu_focus(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < GAME_UI_MENU_ITEM_COUNT; ++i) {
+        game_ui_set_button_focus(s_menu_buttons[i], i == s_menu_index);
+    }
+    if (!s_menu_hint) {
+        return;
+    }
+    if (s_menu_index == 1U) {
+        lv_label_set_text(s_menu_hint, "K5 : 速度");
+    } else if (s_menu_index == 2U) {
+        lv_label_set_text(s_menu_hint, "K5 : 穿墙");
+    } else {
+        lv_label_set_text(s_menu_hint, "K5 : 开始游戏");
+    }
+}
+
+static void game_ui_refresh_end_focus(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < GAME_UI_END_ITEM_COUNT; ++i) {
+        game_ui_set_button_focus(s_end_buttons[i], i == s_end_index);
+    }
+}
+
+static void game_ui_start_game(void);
+static void game_ui_retry_game(void);
+
+static void game_ui_activate_menu(void)
+{
+    if (s_menu_index == 1U) {
+        s_speed_level = (uint8_t)((s_speed_level + 1U) % 3U);
+        snake_game_set_speed_level(&s_game, s_speed_level);
+        s_render_pending = true;
+        game_ui_log_page("菜单确认速度");
+    } else if (s_menu_index == 2U) {
+        s_wrap_enabled = !s_wrap_enabled;
+        snake_game_set_wrap(&s_game, s_wrap_enabled);
+        s_render_pending = true;
+        game_ui_log_page("菜单确认穿墙");
+    } else {
+        game_ui_port_log_i(TAG, "菜单确认开始游戏");
+        game_ui_start_game();
+    }
+}
+
 static lv_obj_t *game_ui_make_rect(lv_obj_t *parent, int32_t x, int32_t y,
                                    int32_t width, int32_t height,
                                    uint32_t color)
@@ -273,6 +392,8 @@ static void game_ui_render_menu(void *user_data);
 static void game_ui_render_game(void *user_data);
 static void game_ui_render_end(void *user_data);
 static void game_ui_render_current(void *user_data);
+static void game_ui_start_game(void);
+static void game_ui_retry_game(void);
 
 static void game_ui_start_game(void)
 {
@@ -283,7 +404,6 @@ static void game_ui_start_game(void)
     s_rendered_score = -1;
     s_rendered_best_score = -1;
     s_rendered_paused = false;
-    s_board_needs_full_refresh = true;
     s_wiggle_phase_ms = 0;
     s_wiggle_elapsed_ms = 0;
     s_wiggle_dirty = true;
@@ -294,6 +414,7 @@ static void game_ui_start_game(void)
         s_snake_rendered_y[i] = INT16_MIN;
     }
     s_render_pending = true;
+    game_ui_log_page("进入游戏");
 }
 
 static void game_ui_retry_game(void)
@@ -305,7 +426,6 @@ static void game_ui_retry_game(void)
     s_rendered_score = -1;
     s_rendered_best_score = -1;
     s_rendered_paused = false;
-    s_board_needs_full_refresh = true;
     s_wiggle_phase_ms = 0;
     s_wiggle_elapsed_ms = 0;
     s_wiggle_dirty = true;
@@ -316,11 +436,13 @@ static void game_ui_retry_game(void)
         s_snake_rendered_y[i] = INT16_MIN;
     }
     s_render_pending = true;
+    game_ui_log_page("再来一局");
 }
 
 static void game_ui_start_clicked(lv_event_t *event)
 {
     (void)event;
+    s_menu_index = 0U;
     game_ui_start_game();
     game_ui_render_game(NULL);
     s_render_pending = false;
@@ -329,24 +451,28 @@ static void game_ui_start_clicked(lv_event_t *event)
 static void game_ui_speed_clicked(lv_event_t *event)
 {
     (void)event;
+    s_menu_index = 1U;
     s_speed_level = (uint8_t)((s_speed_level + 1U) % 3U);
     snake_game_set_speed_level(&s_game, s_speed_level);
-    lv_label_set_text_fmt(s_menu_speed_label, "速度：%s  (" GAME_UI_KEY2_TEXT ")",
-                          game_ui_speed_name());
+    lv_label_set_text_fmt(s_menu_speed_label, "速度：%s", game_ui_speed_name());
+    game_ui_refresh_menu_focus();
 }
 
 static void game_ui_wrap_clicked(lv_event_t *event)
 {
     (void)event;
+    s_menu_index = 2U;
     s_wrap_enabled = !s_wrap_enabled;
     snake_game_set_wrap(&s_game, s_wrap_enabled);
-    lv_label_set_text_fmt(s_menu_wrap_label, "穿墙：%s  (" GAME_UI_KEY3_TEXT ")",
+    lv_label_set_text_fmt(s_menu_wrap_label, "穿墙：%s",
                           s_wrap_enabled ? "开" : "关");
+    game_ui_refresh_menu_focus();
 }
 
 static void game_ui_retry_clicked(lv_event_t *event)
 {
     (void)event;
+    s_end_index = 0U;
     game_ui_retry_game();
     game_ui_render_game(NULL);
     s_render_pending = false;
@@ -355,8 +481,10 @@ static void game_ui_retry_clicked(lv_event_t *event)
 static void game_ui_back_clicked(lv_event_t *event)
 {
     (void)event;
+    s_menu_index = 0U;
     s_page = GAME_UI_PAGE_MENU;
     s_render_pending = false;
+    game_ui_log_page("返回首页");
     game_ui_render_menu(NULL);
 }
 
@@ -373,34 +501,96 @@ static void game_ui_create_menu(void)
     lv_obj_set_width(s_menu_title, lv_pct(100));
     lv_obj_set_style_text_align(s_menu_title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
 
-    lv_obj_t *start = game_ui_make_button(s_screen, "开始游戏  (" GAME_UI_KEY1_TEXT ")",
-                                          NULL);
-    lv_obj_set_width(start, lv_pct(100));
-    lv_obj_set_height(start, 52);
-    lv_obj_add_event_cb(start, game_ui_start_clicked, LV_EVENT_CLICKED, NULL);
+    s_menu_buttons[0] = game_ui_make_button(s_screen, "开始游戏", NULL);
+    lv_obj_set_width(s_menu_buttons[0], lv_pct(100));
+    lv_obj_set_height(s_menu_buttons[0], 52);
+    lv_obj_add_event_cb(s_menu_buttons[0], game_ui_start_clicked,
+                        LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *speed = game_ui_make_button(s_screen, "速度：慢  (" GAME_UI_KEY2_TEXT ")",
-                                          &s_menu_speed_label);
-    lv_obj_set_width(speed, lv_pct(100));
-    lv_obj_set_height(speed, 48);
-    lv_obj_add_event_cb(speed, game_ui_speed_clicked, LV_EVENT_CLICKED, NULL);
+    s_menu_buttons[1] = game_ui_make_button(s_screen, "速度：慢",
+                                            &s_menu_speed_label);
+    lv_obj_set_width(s_menu_buttons[1], lv_pct(100));
+    lv_obj_set_height(s_menu_buttons[1], 48);
+    lv_obj_add_event_cb(s_menu_buttons[1], game_ui_speed_clicked,
+                        LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *wrap = game_ui_make_button(s_screen, "穿墙：开  (" GAME_UI_KEY3_TEXT ")",
-                                         &s_menu_wrap_label);
-    lv_obj_set_width(wrap, lv_pct(100));
-    lv_obj_set_height(wrap, 48);
-    lv_obj_add_event_cb(wrap, game_ui_wrap_clicked, LV_EVENT_CLICKED, NULL);
+    s_menu_buttons[2] = game_ui_make_button(s_screen, "穿墙：开",
+                                            &s_menu_wrap_label);
+    lv_obj_set_width(s_menu_buttons[2], lv_pct(100));
+    lv_obj_set_height(s_menu_buttons[2], 48);
+    lv_obj_add_event_cb(s_menu_buttons[2], game_ui_wrap_clicked,
+                        LV_EVENT_CLICKED, NULL);
 
     s_menu_high_score = game_ui_make_label(s_screen, "最高分：0", COLOR_TEXT,
                                            game_ui_font_body());
     lv_obj_set_width(s_menu_high_score, lv_pct(100));
     lv_obj_set_style_text_align(s_menu_high_score, LV_TEXT_ALIGN_CENTER,
                                 LV_PART_MAIN);
+
+    s_menu_hint = game_ui_make_label(s_screen, "K5 : 开始游戏", COLOR_ACCENT,
+                                     game_ui_font_body());
+    lv_obj_set_width(s_menu_hint, lv_pct(100));
+    lv_obj_set_style_text_align(s_menu_hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    s_menu_index = 0U;
+    game_ui_refresh_menu_focus();
+}
+
+/**
+ * @brief 在棋盘背景上画网格, 避免为 540 格各建一个 lv_obj.
+ *
+ * 每格一个对象会把内部小块堆打满, lv_realloc 失败后写空指针死机.
+ */
+static void game_ui_board_draw_grid(lv_event_t *event)
+{
+    lv_obj_t *obj;
+    lv_layer_t *layer;
+    lv_area_t coords;
+    lv_draw_line_dsc_t line_dsc;
+    uint16_t i;
+
+    if (!event || lv_event_get_code(event) != LV_EVENT_DRAW_MAIN) {
+        return;
+    }
+    obj = lv_event_get_target_obj(event);
+    layer = lv_event_get_layer(event);
+    if (!obj || !layer) {
+        return;
+    }
+
+    lv_obj_get_coords(obj, &coords);
+    lv_draw_line_dsc_init(&line_dsc);
+    line_dsc.color = lv_color_hex(COLOR_GRID);
+    line_dsc.opa = LV_OPA_30;
+    line_dsc.width = 1;
+    line_dsc.raw_end = 1;
+
+    for (i = 1U; i < SNAKE_BOARD_WIDTH; ++i) {
+        int32_t x = coords.x1 + ((int32_t)i * (int32_t)GAME_UI_CELL_PX);
+        line_dsc.p1.x = x;
+        line_dsc.p1.y = coords.y1;
+        line_dsc.p2.x = x;
+        line_dsc.p2.y = coords.y2;
+        lv_draw_line(layer, &line_dsc);
+    }
+    for (i = 1U; i < SNAKE_BOARD_HEIGHT; ++i) {
+        int32_t y = coords.y1 + ((int32_t)i * (int32_t)GAME_UI_CELL_PX);
+        line_dsc.p1.x = coords.x1;
+        line_dsc.p1.y = y;
+        line_dsc.p2.x = coords.x2;
+        line_dsc.p2.y = y;
+        lv_draw_line(layer, &line_dsc);
+    }
 }
 
 static void game_ui_create_game_screen(void)
 {
+    game_ui_port_log_i(TAG, "开始创建游戏页, 棋盘 %ux%u",
+                       SNAKE_BOARD_WIDTH, SNAKE_BOARD_HEIGHT);
     s_game_screen = lv_obj_create(NULL);
+    if (!s_game_screen) {
+        game_ui_port_log_i(TAG, "创建游戏页失败: screen 为空");
+        return;
+    }
     game_ui_set_screen_style(s_game_screen);
 
     s_status_bar = lv_obj_create(s_game_screen);
@@ -427,6 +617,10 @@ static void game_ui_create_game_screen(void)
     lv_obj_align(pause_hint_label, LV_ALIGN_RIGHT_MID, 0, 0);
 
     s_board = lv_obj_create(s_game_screen);
+    if (!s_board) {
+        game_ui_port_log_i(TAG, "创建游戏页失败: board 为空");
+        return;
+    }
     lv_obj_set_size(s_board, SNAKE_BOARD_WIDTH * GAME_UI_CELL_PX,
                     SNAKE_BOARD_HEIGHT * GAME_UI_CELL_PX);
     lv_obj_set_pos(s_board, 0, GAME_UI_STATUS_BAR_PX);
@@ -434,24 +628,9 @@ static void game_ui_create_game_screen(void)
     lv_obj_set_style_border_width(s_board, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_board, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(s_board, 0, LV_PART_MAIN);
-    for (uint16_t y = 0; y < SNAKE_BOARD_HEIGHT; ++y) {
-        for (uint16_t x = 0; x < SNAKE_BOARD_WIDTH; ++x) {
-            uint16_t index = (uint16_t)(y * SNAKE_BOARD_WIDTH + x);
-            lv_obj_t *cell = lv_obj_create(s_board);
-            lv_obj_remove_style_all(cell);
-            s_cells[index] = cell;
-            lv_obj_set_pos(cell, x * GAME_UI_CELL_PX, y * GAME_UI_CELL_PX);
-            lv_obj_set_size(cell, GAME_UI_CELL_PX, GAME_UI_CELL_PX);
-            lv_obj_set_style_radius(cell, 0, LV_PART_MAIN);
-            lv_obj_set_style_border_width(cell, 1, LV_PART_MAIN);
-            lv_obj_set_style_border_color(cell, lv_color_hex(COLOR_GRID), LV_PART_MAIN);
-            lv_obj_set_style_border_opa(cell, LV_OPA_30, LV_PART_MAIN);
-            lv_obj_set_style_shadow_width(cell, 0, LV_PART_MAIN);
-            lv_obj_set_style_bg_color(cell, lv_color_hex(COLOR_BG), LV_PART_MAIN);
-            lv_obj_set_style_bg_opa(cell, LV_OPA_COVER, LV_PART_MAIN);
-            s_cell_state[index] = 0;
-        }
-    }
+    lv_obj_clear_flag(s_board, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(s_board, game_ui_board_draw_grid, LV_EVENT_DRAW_MAIN,
+                        NULL);
 
     /* 棋盘内侧边界线：不占用格子尺寸，提醒孩子穿墙会从对面出来。 */
     (void)game_ui_make_rect(s_board, 0, 0,
@@ -469,6 +648,10 @@ static void game_ui_create_game_screen(void)
     /* 蛇段图像按实际蛇长懒创建，避免 540 个隐藏对象耗尽 LVGL 内存池。 */
     s_snake_image_count = 0;
     s_food_image = lv_image_create(s_board);
+    if (!s_food_image) {
+        game_ui_port_log_i(TAG, "创建游戏页失败: food 图像为空");
+        return;
+    }
     lv_obj_remove_style_all(s_food_image);
     lv_obj_set_size(s_food_image, GAME_UI_CELL_PX, GAME_UI_CELL_PX);
     lv_image_set_antialias(s_food_image, false);
@@ -500,7 +683,7 @@ static void game_ui_create_game_screen(void)
         &lv_font_cjk_16);
     lv_obj_align(pause_overlay_hint, LV_ALIGN_CENTER, 0, 26);
     lv_obj_add_flag(s_pause_overlay, LV_OBJ_FLAG_HIDDEN);
-
+    game_ui_port_log_i(TAG, "游戏页创建完成");
 }
 
 static void game_ui_create_end_screen(void)
@@ -525,16 +708,18 @@ static void game_ui_create_end_screen(void)
     lv_obj_set_style_text_align(s_end_high_score, LV_TEXT_ALIGN_CENTER,
                                 LV_PART_MAIN);
 
-    lv_obj_t *retry = game_ui_make_button(
-        s_end_screen, "再来一次 (" GAME_UI_KEY1_TEXT ")", NULL);
-    lv_obj_set_width(retry, lv_pct(100));
-    lv_obj_set_height(retry, 52);
-    lv_obj_add_event_cb(retry, game_ui_retry_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back = game_ui_make_button(
-        s_end_screen, "返回首页 (" GAME_UI_KEY5_TEXT ")", NULL);
-    lv_obj_set_width(back, lv_pct(100));
-    lv_obj_set_height(back, 48);
-    lv_obj_add_event_cb(back, game_ui_back_clicked, LV_EVENT_CLICKED, NULL);
+    s_end_buttons[0] = game_ui_make_button(s_end_screen, "再来一次", NULL);
+    lv_obj_set_width(s_end_buttons[0], lv_pct(100));
+    lv_obj_set_height(s_end_buttons[0], 52);
+    lv_obj_add_event_cb(s_end_buttons[0], game_ui_retry_clicked,
+                        LV_EVENT_CLICKED, NULL);
+    s_end_buttons[1] = game_ui_make_button(s_end_screen, "返回首页", NULL);
+    lv_obj_set_width(s_end_buttons[1], lv_pct(100));
+    lv_obj_set_height(s_end_buttons[1], 48);
+    lv_obj_add_event_cb(s_end_buttons[1], game_ui_back_clicked,
+                        LV_EVENT_CLICKED, NULL);
+    s_end_index = 0U;
+    game_ui_refresh_end_focus();
 }
 
 static void game_ui_render_menu(void *user_data)
@@ -543,13 +728,13 @@ static void game_ui_render_menu(void *user_data)
     if (!s_screen) {
         game_ui_create_menu();
     }
-    lv_label_set_text_fmt(s_menu_speed_label, "速度：%s  (" GAME_UI_KEY2_TEXT ")",
-                          game_ui_speed_name());
-    lv_label_set_text_fmt(s_menu_wrap_label, "穿墙：%s  (" GAME_UI_KEY3_TEXT ")",
+    lv_label_set_text_fmt(s_menu_speed_label, "速度：%s", game_ui_speed_name());
+    lv_label_set_text_fmt(s_menu_wrap_label, "穿墙：%s",
                           s_wrap_enabled ? "开" : "关");
     const snake_state_t *state = snake_game_state(&s_game);
     lv_label_set_text_fmt(s_menu_high_score, "最高分：%d",
                           state ? state->best_score : 0);
+    game_ui_refresh_menu_focus();
     lv_screen_load(s_screen);
 }
 
@@ -822,22 +1007,6 @@ static void game_ui_update_board(void)
     if (!state) {
         return;
     }
-    for (uint16_t y = 0; y < SNAKE_BOARD_HEIGHT; ++y) {
-        for (uint16_t x = 0; x < SNAKE_BOARD_WIDTH; ++x) {
-            uint16_t index = (uint16_t)(y * SNAKE_BOARD_WIDTH + x);
-            uint8_t cell_state =
-                (state->food.x == x && state->food.y == y) ? 3U : 0U;
-            if (cell_state == s_cell_state[index]) {
-                continue;
-            }
-            s_cell_state[index] = cell_state;
-            /* 蛇和食物都由独立图像绘制，底格始终保持棋盘色。 */
-            if (cell_state == 3U || cell_state == 0U) {
-                lv_obj_set_style_bg_color(s_cells[index], lv_color_hex(COLOR_BG),
-                                          LV_PART_MAIN);
-            }
-        }
-    }
     game_ui_update_snake(state);
     game_ui_update_decorations(state);
 }
@@ -848,9 +1017,10 @@ static void game_ui_render_game(void *user_data)
     if (!s_game_screen) {
         game_ui_create_game_screen();
     }
-    if (s_board_needs_full_refresh) {
-        memset(s_cell_state, 0xFF, sizeof(s_cell_state));
-        s_board_needs_full_refresh = false;
+    if (!s_game_screen || !s_board) {
+        game_ui_port_log_i(TAG, "渲染游戏页中止: screen=%p board=%p",
+                           (void *)s_game_screen, (void *)s_board);
+        return;
     }
     game_ui_update_board();
     const snake_state_t *state = snake_game_state(&s_game);
@@ -918,6 +1088,7 @@ static void game_ui_render_end(void *user_data)
                           state ? state->score : 0);
     lv_label_set_text_fmt(s_end_high_score, "最高分：%d",
                           state ? state->best_score : 0);
+    game_ui_refresh_end_focus();
     lv_screen_load(s_end_screen);
 }
 
@@ -936,28 +1107,48 @@ static void game_ui_process_key_event(const game_ui_key_event_t *item)
     if (!item) {
         return;
     }
+    game_ui_port_log_i(TAG, "处理按键 K%u type=%u page=%s",
+                       (unsigned)item->key, (unsigned)item->type,
+                       game_ui_page_name(s_page));
     if (s_page == GAME_UI_PAGE_MENU) {
-        if (item->key == GAME_UI_MENU_START_KEY) {
-            game_ui_start_game();
-        } else if (item->key == GAME_UI_MENU_SPEED_KEY) {
-            s_speed_level = (uint8_t)((s_speed_level + 1U) % 3U);
-            snake_game_set_speed_level(&s_game, s_speed_level);
+        if (item->key == GAME_UI_KEY_UP || item->key == GAME_UI_KEY_LEFT) {
+            game_ui_move_index(&s_menu_index, GAME_UI_MENU_ITEM_COUNT, -1);
             s_render_pending = true;
-        } else if (item->key == GAME_UI_MENU_WRAP_KEY) {
-            s_wrap_enabled = !s_wrap_enabled;
-            snake_game_set_wrap(&s_game, s_wrap_enabled);
+            game_ui_log_page("菜单上一项");
+        } else if (item->key == GAME_UI_KEY_DOWN ||
+                   item->key == GAME_UI_KEY_RIGHT) {
+            game_ui_move_index(&s_menu_index, GAME_UI_MENU_ITEM_COUNT, 1);
             s_render_pending = true;
+            game_ui_log_page("菜单下一项");
+        } else if (item->key == GAME_UI_KEY_PAUSE) {
+            game_ui_activate_menu();
         }
         return;
     }
     if (s_page == GAME_UI_PAGE_END) {
-        if (item->key == GAME_UI_END_RETRY_KEY) {
-            game_ui_retry_game();
-        } else if (item->key == GAME_UI_KEY_PAUSE) {
-            s_page = GAME_UI_PAGE_MENU;
+        if (item->key == GAME_UI_KEY_UP || item->key == GAME_UI_KEY_LEFT) {
+            game_ui_move_index(&s_end_index, GAME_UI_END_ITEM_COUNT, -1);
             s_render_pending = true;
+            game_ui_log_page("结束页上一项");
+        } else if (item->key == GAME_UI_KEY_DOWN ||
+                   item->key == GAME_UI_KEY_RIGHT) {
+            game_ui_move_index(&s_end_index, GAME_UI_END_ITEM_COUNT, 1);
+            s_render_pending = true;
+            game_ui_log_page("结束页下一项");
+        } else if (item->key == GAME_UI_KEY_PAUSE) {
+            if (s_end_index == 1U) {
+                s_menu_index = 0U;
+                s_page = GAME_UI_PAGE_MENU;
+                s_render_pending = true;
+                game_ui_log_page("结束页回首页");
+            } else {
+                game_ui_retry_game();
+            }
         }
         return;
+    }
+    if (item->key == GAME_UI_KEY_PAUSE) {
+        game_ui_log_page("游戏内暂停/继续");
     }
     snake_game_set_input(&s_game, game_ui_input_from_key(item->key));
 }
@@ -971,6 +1162,8 @@ static void game_ui_event_callback(const ad_keys_event_t *event, void *user_ctx)
     }
     uint8_t next = (uint8_t)((s_key_head + 1U) % GAME_UI_KEY_QUEUE_LEN);
     if (next == s_key_tail) {
+        game_ui_port_log_i(TAG, "按键队列已满, 丢弃 K%u",
+                           (unsigned)event->key);
         return;
     }
     s_key_queue[s_key_head] = (game_ui_key_event_t){
@@ -998,7 +1191,9 @@ static void game_ui_update_lvgl(void *user_data)
     snake_status_t status = snake_game_get_status(&s_game);
     if (status == SNAKE_STATUS_GAME_OVER && s_page != GAME_UI_PAGE_END) {
         s_page = GAME_UI_PAGE_END;
+        s_end_index = 0U;
         s_render_pending = true;
+        game_ui_log_page("游戏结束");
     }
     if (s_render_pending ||
         (s_page == GAME_UI_PAGE_GAME && s_wiggle_dirty)) {
@@ -1098,6 +1293,7 @@ static void game_ui_create_initial(void *user_data)
     (void)user_data;
     s_page = GAME_UI_PAGE_MENU;
     s_render_pending = false;
+    game_ui_log_page("首次加载菜单");
     game_ui_render_menu(NULL);
 }
 
