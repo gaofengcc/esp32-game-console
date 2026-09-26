@@ -2,6 +2,7 @@ build/
 build.pre_target.*/
 sdkconfig
 sdkconfig.old
+sdkconfig.defaults.local
 managed_components/
 dependencies.lock
 output/
