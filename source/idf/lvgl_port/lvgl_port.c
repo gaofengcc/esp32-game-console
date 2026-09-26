@@ -51,13 +51,14 @@ typedef struct {
     void *user_data;
     SemaphoreHandle_t done;
     volatile uint32_t state;
+    volatile uint32_t refs;
     void (*timeout_cleanup)(void *user_data);
 } lvgl_port_work_item_t;
 
 enum {
-    LVGL_PORT_WORK_WAITING = 0,
-    LVGL_PORT_WORK_DONE = 1,
-    LVGL_PORT_WORK_TIMED_OUT = 2,
+    LVGL_PORT_WORK_PROCESSING = 0,
+    LVGL_PORT_WORK_CALLER_TIMED_OUT = 1,
+    LVGL_PORT_WORK_FINISHED = 2,
 };
 
 typedef struct {
@@ -138,6 +139,7 @@ static void touch_apply_calibration(uint16_t raw_x, uint16_t raw_y, int16_t *scr
 static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data,
                                           TickType_t timeout_ticks,
                                           void (*timeout_cleanup)(void *user_data));
+static void lvgl_port_work_release(lvgl_port_work_item_t *item);
 static void lvgl_port_capture_in_lvgl_task(void *user_data);
 static void lvgl_port_capture_cleanup(void *user_data);
 
@@ -246,6 +248,17 @@ void *lvgl_port_get_indev(void)
     return indev;
 }
 
+static void lvgl_port_work_release(lvgl_port_work_item_t *item)
+{
+    if (item == NULL) {
+        return;
+    }
+    if (__atomic_sub_fetch(&item->refs, 1U, __ATOMIC_ACQ_REL) == 0U) {
+        vSemaphoreDelete(item->done);
+        free(item);
+    }
+}
+
 esp_err_t lvgl_port_call(lvgl_port_work_cb_t cb, void *user_data)
 {
     return lvgl_port_call_internal(cb, user_data, portMAX_DELAY, NULL);
@@ -292,7 +305,8 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
         .cb = cb,
         .user_data = user_data,
         .done = done,
-        .state = LVGL_PORT_WORK_WAITING,
+        .state = LVGL_PORT_WORK_PROCESSING,
+        .refs = 2, /* 调用方 + LVGL 队列处理方各持有一个引用。 */
         .timeout_cleanup = timeout_cleanup,
     };
     lvgl_port_work_item_t *item_ptr = item;
@@ -305,36 +319,38 @@ static esp_err_t lvgl_port_call_internal(lvgl_port_work_cb_t cb, void *user_data
                                 ? pdMS_TO_TICKS(1000)
                                 : timeout_ticks;
     if (xQueueSend(s_work_queue, &item_ptr, queue_wait) != pdTRUE) {
-        vSemaphoreDelete(done);
-        free(item);
         if (timeout_cleanup) {
             timeout_cleanup(user_data);
         }
+        lvgl_port_work_release(item); /* 队列处理方引用未转移。 */
+        lvgl_port_work_release(item); /* 调用方引用。 */
         return ESP_ERR_TIMEOUT;
     }
 
     if (xSemaphoreTake(done, timeout_ticks) == pdTRUE) {
         /*
-         * LVGL 任务在 Give 之前已将状态置为 DONE，因此此处可以安全
-         * 回收队列项。回调对 user_data 的访问已经结束。
+         * 工作方在 Give 之前后都持有自己的引用；此处只释放调用方
+         * 引用，不会与 LVGL 任务的收尾路径并发释放队列项。
          */
-        vSemaphoreDelete(done);
-        free(item);
+        lvgl_port_work_release(item);
         return ESP_OK;
     }
 
     /*
      * 超时后不能直接释放 item：它可能仍在队列中，或正在 LVGL 任务中
-     * 执行。用状态转移把释放责任交给“最后完成的一方”，避免 UAF。
+     * 执行。调用方先发布超时状态，再释放自己的引用；若回调已完成，
+     * 则由调用方负责回收 BMP，否则由 LVGL 处理方负责回收。
      */
-    uint32_t expected = LVGL_PORT_WORK_WAITING;
+    uint32_t expected = LVGL_PORT_WORK_PROCESSING;
     if (!__atomic_compare_exchange_n(&item->state, &expected,
-                                     LVGL_PORT_WORK_TIMED_OUT, false,
+                                     LVGL_PORT_WORK_CALLER_TIMED_OUT, false,
                                      __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        /* 回调已完成并发出信号，当前任务取得最终回收权。 */
-        vSemaphoreDelete(done);
-        free(item);
+        /* 回调已完成，当前任务取得请求数据的回收权。 */
+        if (expected == LVGL_PORT_WORK_FINISHED && timeout_cleanup) {
+            timeout_cleanup(user_data);
+        }
     }
+    lvgl_port_work_release(item);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -890,21 +906,20 @@ static void lvgl_port_process_work_queue(void)
         }
 
         /*
-         * 先发布 DONE，再唤醒等待者。这样等待者拿到信号后，LVGL
-         * 任务不会再访问 item；若等待者已经超时，则由此处负责回收。
+         * 处理方始终持有一个引用，先发出完成信号再转换状态；即使
+         * 调用方恰好超时并释放自己的引用，也不会提前释放 item。
          */
-        uint32_t expected = LVGL_PORT_WORK_WAITING;
-        if (__atomic_compare_exchange_n(&item->state, &expected,
-                                         LVGL_PORT_WORK_DONE, false,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            xSemaphoreGive(item->done);
-        } else if (expected == LVGL_PORT_WORK_TIMED_OUT) {
+        xSemaphoreGive(item->done);
+        uint32_t expected = LVGL_PORT_WORK_PROCESSING;
+        if (!__atomic_compare_exchange_n(&item->state, &expected,
+                                          LVGL_PORT_WORK_FINISHED, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) &&
+            expected == LVGL_PORT_WORK_CALLER_TIMED_OUT) {
             if (item->timeout_cleanup) {
                 item->timeout_cleanup(item->user_data);
             }
-            vSemaphoreDelete(item->done);
-            free(item);
         }
+        lvgl_port_work_release(item);
     }
 }
 
