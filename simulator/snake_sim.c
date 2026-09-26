@@ -7,6 +7,8 @@
 #include <string.h>
 
 #include "game_ui.h"
+#include "klotski_logic.h"
+#include "klotski_ui.h"
 #include "lvgl_bmp_encoder.h"
 #include "maze_gen.h"
 #include "maze_logic.h"
@@ -15,9 +17,11 @@
 #include "snake_logic.h"
 #include "zlib.h"
 
+/* 帧缓冲和 LVGL 显示器保持固件的逻辑分辨率。 */
 #define W 480
 #define H 320
 
+/* flush_cb 写入的 RGB565 帧缓冲；统计值用于检查局部刷新是否失控。 */
 static uint16_t fb[W * H];
 static lv_display_t *disp;
 static SDL_Window *win;
@@ -30,6 +34,7 @@ static uint32_t flush_max_area;
 
 static void reset_flush_stats(void)
 {
+    /* 每个场景只统计准备完成后的动画/步进刷新。 */
     flush_count = 0;
     flush_pixels = 0;
     flush_max_area = 0;
@@ -46,6 +51,7 @@ static void flush_cb(lv_display_t *d, const lv_area_t *a, uint8_t *px)
     if (area > flush_max_area) {
         flush_max_area = area;
     }
+    /* LVGL partial buffer 的行跨度等于当前 area 宽度。 */
     const uint16_t *src = (const uint16_t *)px;
     for (uint32_t y = 0; y < h; y++) {
         memcpy(&fb[(a->y1 + y) * W + a->x1], src + y * w, w * 2);
@@ -176,12 +182,14 @@ static int write_shot(const char *path)
 
 static void pump_lvgl(void)
 {
+    /* simulator 没有独立 LVGL 线程，测试点显式驱动一次 handler + 刷新。 */
     lv_timer_handler();
     lv_refr_now(disp);
 }
 
 static void advance_ms(uint32_t elapsed_ms)
 {
+    /* 同步推进 LVGL tick 和 game_ui 逻辑，再把待渲染区域刷入 fb。 */
     lv_tick_inc(elapsed_ms ? elapsed_ms : 1U);
     game_ui_update(elapsed_ms);
     pump_lvgl();
@@ -210,7 +218,14 @@ static uint8_t parse_key(const char *token)
 
 static void inject_token(const char *token)
 {
-    sim_port_inject_key(parse_key(token), AD_KEYS_EVENT_PRESS);
+    uint8_t key = parse_key(token);
+
+    /* 场景脚本使用人类可读 token，最终仍走与设备相同的按键回调。
+       确认键在 UI 层只认抬起, 这里补一次足够长的 RELEASE. */
+    sim_port_inject_key(key, AD_KEYS_EVENT_PRESS);
+    if (key == 5U) {
+        sim_port_inject_key_held(key, AD_KEYS_EVENT_RELEASE, 80U);
+    }
     advance_ms(0);
 }
 
@@ -1084,6 +1099,222 @@ static int selftest_maze_hold(void)
     return all ? 0 : 1;
 }
 
+/**
+ * @brief 华容道逻辑层自测: 加载, 移动, 阻挡, 胜利和关卡表合法性.
+ *
+ * @return 全部通过返回 0, 否则 1.
+ */
+static int selftest_klotski_logic(void)
+{
+    int all = 1;
+    klotski_game_t game;
+    const klotski_state_t *state;
+    klotski_event_t event;
+
+    klotski_game_init(&game);
+    all &= check_item("klotski_load_level_0",
+                      klotski_game_load_level(&game, 0U));
+    state = klotski_game_state(&game);
+    all &= check_item("klotski_initial_state",
+                      state && state->level == 0U && state->steps == 0U &&
+                          !state->won);
+    all &= check_item("klotski_load_out_of_range",
+                      !klotski_game_load_level(&game, KLOTSKI_LEVEL_COUNT));
+
+    /* 第1关: 曹操 anchor (2,3), 空格在 (1,1) 和 (2,2) */
+    all &= check_item("klotski_piece_at_cao",
+                      klotski_game_piece_at(&game, 2U, 3U) == 0);
+    all &= check_item("klotski_piece_at_empty",
+                      klotski_game_piece_at(&game, 1U, 1U) == -1);
+    all &= check_item("klotski_piece_at_out_of_range",
+                      klotski_game_piece_at(&game, 4U, 0U) == -1);
+
+    /* 曹操被将军围住, 左移被挡, 步数不变 */
+    event = klotski_game_move(&game, KLOTSKI_PIECE_CAO, KLOTSKI_DIR_LEFT);
+    all &= check_item("klotski_move_blocked",
+                      event == KLOTSKI_EVENT_BLOCKED && state->steps == 0U);
+
+    /* 兵 (0,1) 右移到空格 (1,1), 步数加一 */
+    event = klotski_game_move(&game, 9U, KLOTSKI_DIR_RIGHT);
+    state = klotski_game_state(&game);
+    all &= check_item("klotski_move_ok",
+                      event == KLOTSKI_EVENT_MOVED && state->steps == 1U &&
+                          klotski_game_piece_at(&game, 1U, 1U) == 9 &&
+                          klotski_game_piece_at(&game, 0U, 1U) == -1);
+
+    /* 手工摆出曹操贴出口左侧的形状, 右移一格即胜利 */
+    game.state.pieces[0] = (klotski_piece_t){0U, 3U, 2U, 2U};
+    game.state.pieces[1] = (klotski_piece_t){0U, 0U, 2U, 1U};
+    game.state.pieces[2] = (klotski_piece_t){2U, 0U, 1U, 2U};
+    game.state.pieces[3] = (klotski_piece_t){3U, 0U, 1U, 2U};
+    game.state.pieces[4] = (klotski_piece_t){0U, 1U, 1U, 2U};
+    game.state.pieces[5] = (klotski_piece_t){1U, 1U, 1U, 2U};
+    game.state.pieces[6] = (klotski_piece_t){2U, 2U, 1U, 1U};
+    game.state.pieces[7] = (klotski_piece_t){3U, 2U, 1U, 1U};
+    game.state.pieces[8] = (klotski_piece_t){3U, 3U, 1U, 1U};
+    game.state.pieces[9] = (klotski_piece_t){3U, 4U, 1U, 1U};
+    game.state.steps = 0U;
+    game.state.won = false;
+    event = klotski_game_move(&game, KLOTSKI_PIECE_CAO, KLOTSKI_DIR_RIGHT);
+    state = klotski_game_state(&game);
+    all &= check_item("klotski_win",
+                      event == KLOTSKI_EVENT_WIN && state->won &&
+                          state->steps == 1U);
+    event = klotski_game_move(&game, KLOTSKI_PIECE_CAO, KLOTSKI_DIR_LEFT);
+    all &= check_item("klotski_no_move_after_win",
+                      event == KLOTSKI_EVENT_NONE);
+
+    /* 全部关卡: 能加载, 初始布局无重叠且恰好两个空格, 最少步数大于 0 */
+    {
+        int levels_ok = 1;
+        for (uint8_t lv = 0U; lv < KLOTSKI_LEVEL_COUNT; ++lv) {
+            const klotski_level_def_t *def = klotski_level_def(lv);
+            int empty = 0;
+
+            if (!def || !def->name || def->min_steps == 0U ||
+                !klotski_game_load_level(&game, lv)) {
+                levels_ok = 0;
+                break;
+            }
+            for (uint8_t y = 0U; y < KLOTSKI_ROWS; ++y) {
+                for (uint8_t x = 0U; x < KLOTSKI_COLS; ++x) {
+                    if (klotski_game_piece_at(&game, x, y) < 0) {
+                        ++empty;
+                    }
+                }
+            }
+            if (empty != 2) {
+                levels_ok = 0;
+                break;
+            }
+        }
+        all &= check_item("klotski_all_levels_legal", levels_ok);
+    }
+    {
+        const klotski_level_def_t *last =
+            klotski_level_def(KLOTSKI_LEVEL_COUNT - 1U);
+        all &= check_item("klotski_hengdao_116",
+                          last && last->min_steps == 116U);
+    }
+    all &= check_item("klotski_level_def_out_of_range",
+                      klotski_level_def(KLOTSKI_LEVEL_COUNT) == NULL);
+    all &= check_item("klotski_exit_cells",
+                      klotski_is_exit_cell(1U, 4U) &&
+                          klotski_is_exit_cell(2U, 4U) &&
+                          !klotski_is_exit_cell(0U, 4U));
+    all &= check_item("klotski_piece_names",
+                      klotski_piece_name(0U)[0] != '\0' &&
+                          klotski_piece_name(KLOTSKI_PIECE_COUNT)[0] == '\0');
+    return all ? 0 : 1;
+}
+
+/**
+ * @brief 华容道 UI 自测: 选关, 光标, 拿起/滑动, 暂停, 胜利和返回.
+ * 必须在选择页初始状态 (选中贪吃蛇) 下运行, 结束后回到选择页.
+ *
+ * @return 全部通过返回 0, 否则 1.
+ */
+static int selftest_klotski_ui(void)
+{
+    int all = 1;
+    const klotski_state_t *state;
+
+    /* 选择页: 贪吃蛇 -> 迷宫 -> 华容道, 确认进入选关列表 */
+    inject_token("DOWN");
+    inject_token("DOWN");
+    inject_token("K5");
+    all &= check_item("klotski_ui_enter_select",
+                      !strcmp(game_ui_get_page_name(), "klotski_select"));
+
+    /* 确认第1关进入对局, 光标落在曹操上 */
+    inject_token("K5");
+    state = klotski_ui_state();
+    all &= check_item("klotski_ui_enter_game",
+                      !strcmp(game_ui_get_page_name(), "klotski") && state &&
+                          state->level == 0U && state->steps == 0U);
+
+    /* 拿起曹操, 向屏幕左滑 (逻辑左移) 被将军挡住, 步数不变, 再放下.
+       注意: 对局为横向显示, 屏幕方向键已映射, 逻辑左 = 屏幕上 */
+    inject_token("K5");
+    inject_token("UP");
+    state = klotski_ui_state();
+    all &= check_item("klotski_ui_move_blocked",
+                      state && state->steps == 0U &&
+                          !strcmp(game_ui_get_page_name(), "klotski"));
+    inject_token("K5");
+
+    /* 光标移到空格 (逻辑 (2,2)), 空格上按 K5 打开暂停菜单 */
+    inject_token("LEFT");
+    inject_token("K5");
+    all &= check_item("klotski_ui_pause_open",
+                      !strcmp(game_ui_get_page_name(), "klotski_paused"));
+    inject_token("K5");
+    all &= check_item("klotski_ui_pause_resume",
+                      !strcmp(game_ui_get_page_name(), "klotski"));
+
+    /* 光标走到兵 (逻辑 (0,1)), 拿起向屏幕下滑 (逻辑右移) 一格, 步数变 1 */
+    inject_token("LEFT");
+    inject_token("UP");
+    inject_token("UP");
+    inject_token("K5");
+    inject_token("DOWN");
+    state = klotski_ui_state();
+    all &= check_item("klotski_ui_slide_step",
+                      state && state->steps == 1U &&
+                          klotski_ui_state()->pieces[9].x == 1U &&
+                          klotski_ui_state()->pieces[9].y == 1U);
+    inject_token("K5");
+
+    /* 直接触发胜利, 弹窗延时后出现, 确认进入下一关 */
+    klotski_ui_force_win();
+    advance_ms(10U);
+    all &= check_item("klotski_ui_win_dialog",
+                      !strcmp(game_ui_get_page_name(), "klotski_win"));
+    inject_token("K5");
+    state = klotski_ui_state();
+    all &= check_item("klotski_ui_next_level",
+                      state && state->level == 1U && state->steps == 0U &&
+                          !strcmp(game_ui_get_page_name(), "klotski"));
+
+    /* 第2关: 光标移到空格 (逻辑 (2,2)), 打开菜单选"返回选关" */
+    inject_token("LEFT");
+    inject_token("K5");
+    inject_token("DOWN");
+    inject_token("DOWN");
+    inject_token("K5");
+    all &= check_item("klotski_ui_back_to_select",
+                      !strcmp(game_ui_get_page_name(), "klotski_select"));
+
+    /* 测试接口: 直接进最后一关 (横刀立马), 越界下标必须被忽略 */
+    klotski_ui_start_level(KLOTSKI_LEVEL_COUNT - 1U);
+    state = klotski_ui_state();
+    all &= check_item("klotski_ui_start_level",
+                      state && state->level == KLOTSKI_LEVEL_COUNT - 1U &&
+                          !strcmp(game_ui_get_page_name(), "klotski"));
+    klotski_ui_start_level(KLOTSKI_LEVEL_COUNT);
+    all &= check_item("klotski_ui_start_level_out_of_range",
+                      klotski_ui_state()->level == KLOTSKI_LEVEL_COUNT - 1U);
+
+    /* 回到选关列表, 按上到顶钳位停住 (不环绕), 确认仍在第1关 */
+    klotski_ui_enter_menu();
+    inject_token("UP");
+    inject_token("K5");
+    state = klotski_ui_state();
+    all &= check_item("klotski_ui_clamp_top",
+                      state && state->level == 0U &&
+                          !strcmp(game_ui_get_page_name(), "klotski"));
+
+    /* 连按 25 次下: 24 次到"返回", 第 25 次钳位停住, 确认回到游戏选择页 */
+    klotski_ui_enter_menu();
+    for (uint32_t i = 0; i < 25U; ++i) {
+        inject_token("DOWN");
+    }
+    inject_token("K5");
+    all &= check_item("klotski_ui_back_home",
+                      !strcmp(game_ui_get_page_name(), "select"));
+    return all ? 0 : 1;
+}
+
 static int selftest_ui(void)
 {
     int all = 1;
@@ -1212,6 +1443,35 @@ static int run_scene(const char *scene, const char *keys, int steps,
         enter_maze_challenge_theme(MAZE_UI_THEME_SPACE);
     } else if (scene && !strcmp(scene, "maze_actor_ocean")) {
         enter_maze_challenge_theme(MAZE_UI_THEME_OCEAN);
+    } else if (scene && !strcmp(scene, "klotski_select")) {
+        inject_token("DOWN");
+        inject_token("DOWN");
+        inject_token("K5");
+    } else if (scene && !strcmp(scene, "klotski")) {
+        /* 经典"横刀立马"布局. 必须走真实按键路径, 让外壳切到华容道,
+           直接调 klotski_ui_start_level 会导致渲染仍停在游戏选择页 */
+        inject_token("DOWN");
+        inject_token("DOWN");
+        inject_token("K5");
+        /* 选关列表钳位导航: 连按 23 次下到"横刀立马" */
+        inject_keys("DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,"
+                    "DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,DOWN,"
+                    "DOWN,DOWN,DOWN,K5");
+    } else if (scene && !strcmp(scene, "klotski_win")) {
+        /* 真实通关第 1 关 (BFS 最优 6 步: 关羽右, 马超上上, 兵右,
+           黄忠左, 曹操左, 均为逻辑方向), 走完整胜利流程, 保证截图是合法终盘.
+           对局为横向显示, 注入的是屏幕方向: 逻辑右=屏幕下, 逻辑上=屏幕左 */
+        inject_token("DOWN");
+        inject_token("DOWN");
+        inject_token("K5");
+        inject_token("K5");
+        inject_keys("UP,UP,LEFT,K5,DOWN,K5,"
+                    "UP,RIGHT,K5,LEFT,K5,"
+                    "LEFT,K5,DOWN,K5,"
+                    "UP,RIGHT,K5,LEFT,K5,"
+                    "DOWN,RIGHT,RIGHT,K5,UP,K5,"
+                    "DOWN,DOWN,K5,UP,K5");
+        advance_ms(800U);
     } else if (scene && !strcmp(scene, "head_down")) {
         enter_snake_game();
         inject_token("K3");
@@ -1296,6 +1556,8 @@ int main(int argc, char **argv)
     }
 
     remove(score_path);
+    /* 华容道最佳成绩 blob 也清掉, 保证自测结果确定 */
+    remove("simulator/.klotski_best");
     sim_port_set_score_path(score_path);
     if (init_simulator() != 0) {
         return 1;
@@ -1305,11 +1567,14 @@ int main(int argc, char **argv)
         int logic_rc = selftest_logic();
         int maze_rc = selftest_maze_logic();
         int maze_gen_rc = selftest_maze_gen();
+        int klotski_logic_rc = selftest_klotski_logic();
+        /* 华容道 UI 自测依赖选择页初始状态, 必须在其它 UI 自测之前运行 */
+        int klotski_ui_rc = selftest_klotski_ui();
         int shot_rc = selftest_shot();
         int ui_rc = selftest_ui();
         int hold_rc = selftest_maze_hold();
-        rc = logic_rc || maze_rc || maze_gen_rc || shot_rc || ui_rc ||
-             hold_rc;
+        rc = logic_rc || maze_rc || maze_gen_rc || klotski_logic_rc ||
+             klotski_ui_rc || shot_rc || ui_rc || hold_rc;
     } else {
         rc = run_scene(scene, keys, steps, advance_step_ms);
     }

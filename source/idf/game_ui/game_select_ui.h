@@ -29,7 +29,7 @@ typedef void (*game_select_choose_cb_t)(game_select_id_t id);
 void game_select_ui_init(game_select_choose_cb_t on_choose);
 
 /**
- * @brief 进入选择页, 复位选中项并请求重绘.
+ * @brief 进入选择页并请求重绘, 保留上次选中的游戏.
  *
  * @return 无.
  */

@@ -14,9 +14,11 @@ set(SIM_COMMON_SRCS
     ../source/idf/game_ui/game_select_ui.c
     ../source/idf/game_ui/snake_ui.c
     ../source/idf/game_ui/maze_ui.c
+    ../source/idf/game_ui/klotski_ui.c
     ../source/game/snake_logic.c
     ../source/game/maze_logic.c
     ../source/game/maze_gen.c
+    ../source/game/klotski_logic.c
     ../source/idf/lvgl_port/lvgl_bmp_encoder.c
     ../source/idf/lvgl_port/lv_font_cjk.c
     ../source/idf/lvgl_port/lv_font_cjk_ui.c)

@@ -2,24 +2,31 @@
 
 #include "game_select_ui.h"
 #include "game_ui_common.h"
+#include "klotski_ui.h"
 #include "maze_ui.h"
 #include "snake_ui.h"
 
+/* 按键回调只写入该环形队列，LVGL/game_ui 任务再按序消费。 */
 #define GAME_UI_KEY_QUEUE_LEN 24
+/* 确认键抬起时短于该时间视为回弹, 不触发菜单. */
+#define GAME_UI_MIN_CLICK_MS 50U
 
 typedef enum {
     GAME_UI_KIND_SELECT = 0,
     GAME_UI_KIND_SNAKE,
     GAME_UI_KIND_MAZE,
+    GAME_UI_KIND_KLOTSKI,
 } game_ui_kind_t;
 
 typedef struct {
     uint8_t key;
     ad_keys_event_type_t type;
+    uint32_t held_ms;
 } game_ui_key_event_t;
 
 static const char *TAG = "game_ui";
 static game_ui_key_event_t s_key_queue[GAME_UI_KEY_QUEUE_LEN];
+/* head 指向下一次写入，tail 指向下一次读取；空出一个槽区分满/空。 */
 static uint8_t s_key_head;
 static uint8_t s_key_tail;
 static bool s_task_started;
@@ -39,6 +46,9 @@ static const char *game_ui_kind_page_name(void)
     if (s_kind == GAME_UI_KIND_MAZE) {
         return maze_ui_page_name();
     }
+    if (s_kind == GAME_UI_KIND_KLOTSKI) {
+        return klotski_ui_page_name();
+    }
     return game_select_ui_page_name();
 }
 
@@ -57,7 +67,7 @@ static void game_ui_back_to_select(void)
 /**
  * @brief 选择页确认后切到对应游戏设置.
  *
- * @param id 选中的游戏, GAME_SELECT_MAZE 或贪吃蛇.
+ * @param id 选中的游戏, 贪吃蛇/迷宫/华容道.
  * @return 无.
  */
 static void game_ui_on_choose(game_select_id_t id)
@@ -68,13 +78,19 @@ static void game_ui_on_choose(game_select_id_t id)
         game_ui_port_log_i(TAG, "进入迷宫设置");
         return;
     }
+    if (id == GAME_SELECT_KLOTSKI) {
+        s_kind = GAME_UI_KIND_KLOTSKI;
+        klotski_ui_enter_menu();
+        game_ui_port_log_i(TAG, "进入华容道选关");
+        return;
+    }
     s_kind = GAME_UI_KIND_SNAKE;
     snake_ui_enter_menu();
     game_ui_port_log_i(TAG, "进入贪吃蛇设置");
 }
 
 /**
- * @brief 按键中断/任务回调: 只入队 PRESS/REPEAT, 不直接碰 LVGL.
+ * @brief 按键任务回调: 入队 PRESS/REPEAT/RELEASE, 不直接碰 LVGL.
  *
  * @param event 按键事件, 为空则忽略.
  * @param user_ctx 未使用.
@@ -86,7 +102,8 @@ static void game_ui_event_callback(const ad_keys_event_t *event, void *user_ctx)
 
     (void)user_ctx;
     if (!event || (event->type != AD_KEYS_EVENT_PRESS &&
-                   event->type != AD_KEYS_EVENT_REPEAT)) {
+                   event->type != AD_KEYS_EVENT_REPEAT &&
+                   event->type != AD_KEYS_EVENT_RELEASE)) {
         return;
     }
     next = (uint8_t)((s_key_head + 1U) % GAME_UI_KEY_QUEUE_LEN);
@@ -98,6 +115,7 @@ static void game_ui_event_callback(const ad_keys_event_t *event, void *user_ctx)
     s_key_queue[s_key_head] = (game_ui_key_event_t){
         .key = event->key,
         .type = event->type,
+        .held_ms = event->held_ms,
     };
     s_key_head = next;
 }
@@ -128,18 +146,45 @@ static bool game_ui_pop_key(game_ui_key_event_t *item)
  */
 static void game_ui_process_key_event(const game_ui_key_event_t *item)
 {
+    game_ui_key_event_t click;
+
     if (!item) {
         return;
     }
-    game_ui_port_log_i(TAG, "处理按键 K%u type=%u page=%s",
+    /*
+     * 确认键只在抬起时生效, 且忽略短于 GAME_UI_MIN_CLICK_MS 的回弹.
+     * 页面在手指离开后才切换, 同一次按下不会落到下一页.
+     */
+    if (item->key == GAME_UI_KEY_PAUSE) {
+        if (item->type != AD_KEYS_EVENT_RELEASE) {
+            return;
+        }
+        if (item->held_ms < GAME_UI_MIN_CLICK_MS) {
+            game_ui_port_log_i(TAG, "忽略过短确认 K%u held=%ums page=%s",
+                               (unsigned)item->key, (unsigned)item->held_ms,
+                               game_ui_kind_page_name());
+            return;
+        }
+        click = *item;
+        click.type = AD_KEYS_EVENT_PRESS;
+        item = &click;
+    }
+    game_ui_port_log_i(TAG, "处理按键 K%u type=%u page=%s queue=%u",
                        (unsigned)item->key, (unsigned)item->type,
-                       game_ui_kind_page_name());
+                       game_ui_kind_page_name(),
+                       (unsigned)((s_key_head + GAME_UI_KEY_QUEUE_LEN -
+                                   s_key_tail) %
+                                  GAME_UI_KEY_QUEUE_LEN));
     if (s_kind == GAME_UI_KIND_SNAKE) {
         snake_ui_handle_key(item->key, item->type);
         return;
     }
     if (s_kind == GAME_UI_KIND_MAZE) {
         maze_ui_handle_key(item->key, item->type);
+        return;
+    }
+    if (s_kind == GAME_UI_KIND_KLOTSKI) {
+        klotski_ui_handle_key(item->key, item->type);
         return;
     }
     game_select_ui_handle_key(item->key, item->type);
@@ -159,6 +204,10 @@ static void game_ui_render_current(void *user_data)
     }
     if (s_kind == GAME_UI_KIND_MAZE) {
         maze_ui_render(user_data);
+        return;
+    }
+    if (s_kind == GAME_UI_KIND_KLOTSKI) {
+        klotski_ui_render(user_data);
         return;
     }
     game_select_ui_render(user_data);
@@ -199,6 +248,8 @@ void game_ui_update(uint32_t elapsed_ms)
         maze_ui_advance(elapsed_ms);
     } else if (s_kind == GAME_UI_KIND_SNAKE) {
         snake_ui_advance(elapsed_ms);
+    } else if (s_kind == GAME_UI_KIND_KLOTSKI) {
+        klotski_ui_advance(elapsed_ms);
     }
     (void)game_ui_port_call(game_ui_update_lvgl, NULL);
 }
@@ -265,6 +316,7 @@ esp_err_t game_ui_init(void)
     game_select_ui_init(game_ui_on_choose);
     snake_ui_init(game_ui_back_to_select);
     maze_ui_init(game_ui_back_to_select);
+    klotski_ui_init(game_ui_back_to_select);
     s_kind = GAME_UI_KIND_SELECT;
     s_key_head = 0;
     s_key_tail = 0;
@@ -278,9 +330,10 @@ esp_err_t game_ui_init(void)
         return err;
     }
     s_task_started = true;
-    game_ui_port_log_i(TAG, "游戏 UI 已初始化, 贪吃蛇 %ux%u, 迷宫 %ux%u",
+    game_ui_port_log_i(TAG,
+                       "游戏 UI 已初始化, 贪吃蛇 %ux%u, 迷宫 %ux%u, 华容道 %u 关",
                        SNAKE_BOARD_WIDTH, SNAKE_BOARD_HEIGHT,
-                       MAZE_WIDTH, MAZE_HEIGHT);
+                       MAZE_WIDTH, MAZE_HEIGHT, KLOTSKI_LEVEL_COUNT);
     return ESP_OK;
 }
 

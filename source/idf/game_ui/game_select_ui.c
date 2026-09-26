@@ -5,11 +5,19 @@
 #include "game_ui_port.h"
 #include "lvgl.h"
 
+/* 首页固定展示三种游戏，数组和焦点下标都以该数量为边界。 */
 #define GAME_SELECT_ITEM_COUNT 3U
-#define GAME_SELECT_TILE_PX 112
-#define GAME_SELECT_ICON_PX 96
+/* SIZE+HALO: 默认小，选中大并带柔光。 */
+#define GAME_SELECT_TILE_IDLE_PX 88
+#define GAME_SELECT_ICON_IDLE_PX 72
+#define GAME_SELECT_TILE_FOCUS_PX 128
+#define GAME_SELECT_ICON_FOCUS_PX 108
+#define GAME_SELECT_HALO_PAD_PX 18
+#define GAME_SELECT_SLOT_FOCUS_PX \
+    (GAME_SELECT_TILE_FOCUS_PX + (GAME_SELECT_HALO_PAD_PX * 2))
 
 static const char *TAG = "game_select";
+/* 名称和图标按 game_select_id_t 的顺序排列，避免在渲染路径分支。 */
 static const char *const s_select_names[GAME_SELECT_ITEM_COUNT] = {
     "贪吃蛇",
     "迷宫",
@@ -21,14 +29,18 @@ static const lv_image_dsc_t *const s_select_icons[GAME_SELECT_ITEM_COUNT] = {
     &select_icon_klotski,
 };
 
+/* 选择回调由 game_ui 外壳注册；以下对象仅由 LVGL 线程访问。 */
 static game_select_choose_cb_t s_on_choose;
 static lv_obj_t *s_select_screen;
+static lv_obj_t *s_select_slots[GAME_SELECT_ITEM_COUNT];
+static lv_obj_t *s_select_halos[GAME_SELECT_ITEM_COUNT];
 static lv_obj_t *s_select_tiles[GAME_SELECT_ITEM_COUNT];
+static lv_obj_t *s_select_images[GAME_SELECT_ITEM_COUNT];
 static lv_obj_t *s_select_name;
 static uint8_t s_select_index;
 
 /**
- * @brief 按当前下标刷新图标描边, 并在底部显示选中游戏名.
+ * @brief 按当前下标刷新尺寸, 柔光和描边, 并更新底部游戏名.
  *
  * @return 无.
  */
@@ -38,16 +50,51 @@ static void game_select_refresh_focus(void)
 
     for (i = 0U; i < GAME_SELECT_ITEM_COUNT; ++i) {
         bool focused = (i == s_select_index);
+        lv_obj_t *slot = s_select_slots[i];
+        lv_obj_t *halo = s_select_halos[i];
         lv_obj_t *tile = s_select_tiles[i];
+        lv_obj_t *image = s_select_images[i];
+        int32_t tile_px =
+            focused ? GAME_SELECT_TILE_FOCUS_PX : GAME_SELECT_TILE_IDLE_PX;
+        int32_t icon_px =
+            focused ? GAME_SELECT_ICON_FOCUS_PX : GAME_SELECT_ICON_IDLE_PX;
+        int32_t slot_px =
+            focused ? GAME_SELECT_SLOT_FOCUS_PX : GAME_SELECT_TILE_IDLE_PX;
 
-        if (!tile) {
+        if (!slot || !tile) {
             continue;
         }
-        lv_obj_set_style_border_width(tile, focused ? 4 : 2, LV_PART_MAIN);
+        lv_obj_set_size(slot, slot_px, slot_px);
+        lv_obj_set_size(tile, tile_px, tile_px);
+        lv_obj_center(tile);
+        if (image) {
+            lv_obj_set_size(image, icon_px, icon_px);
+            lv_obj_center(image);
+        }
+        lv_obj_set_style_border_width(tile, focused ? 4 : 1, LV_PART_MAIN);
         lv_obj_set_style_border_color(
             tile,
-            lv_color_hex(focused ? GAME_UI_COLOR_ACCENT : GAME_UI_COLOR_BUTTON),
+            lv_color_hex(focused ? GAME_UI_COLOR_ACCENT
+                                 : GAME_UI_COLOR_BUTTON_IDLE),
             LV_PART_MAIN);
+        lv_obj_set_style_bg_color(
+            tile,
+            lv_color_hex(focused ? GAME_UI_COLOR_PANEL : GAME_UI_COLOR_BG),
+            LV_PART_MAIN);
+        if (halo) {
+            if (focused) {
+                lv_obj_set_size(halo,
+                                GAME_SELECT_TILE_FOCUS_PX +
+                                    GAME_SELECT_HALO_PAD_PX,
+                                GAME_SELECT_TILE_FOCUS_PX +
+                                    GAME_SELECT_HALO_PAD_PX);
+                lv_obj_center(halo);
+                lv_obj_clear_flag(halo, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_background(halo);
+            } else {
+                lv_obj_add_flag(halo, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
     }
     if (s_select_name && s_select_index < GAME_SELECT_ITEM_COUNT) {
         lv_label_set_text(s_select_name, s_select_names[s_select_index]);
@@ -68,7 +115,9 @@ static void game_select_activate(void)
     } else if (s_select_index == 2U) {
         id = GAME_SELECT_KLOTSKI;
     }
-    game_ui_port_log_i(TAG, "选择游戏 id=%u", (unsigned)id);
+    game_ui_port_log_i(TAG, "选择游戏 id=%u name=%s index=%u",
+                       (unsigned)id, s_select_names[s_select_index],
+                       (unsigned)s_select_index);
     if (s_on_choose) {
         s_on_choose(id);
     }
@@ -114,34 +163,75 @@ static void game_select_klotski_clicked(lv_event_t *event)
 }
 
 /**
- * @brief 创建一个方形图标, 像素图按最近邻拉伸填满内框.
+ * @brief 创建一个带柔光槽位的方形图标.
  *
  * @param parent 图标行容器.
  * @param icon 静态 RGB565 贴图, 为空则只留空框.
  * @param clicked 点击回调.
- * @return 新建方块; 创建失败返回 NULL.
+ * @param index 槽位下标, 用于写入静态数组.
+ * @return 槽位对象; 创建失败返回 NULL.
  */
-static lv_obj_t *game_select_make_tile(lv_obj_t *parent, const lv_image_dsc_t *icon,
-                                       lv_event_cb_t clicked)
+static lv_obj_t *game_select_make_slot(lv_obj_t *parent, const lv_image_dsc_t *icon,
+                                       lv_event_cb_t clicked, uint8_t index)
 {
+    lv_obj_t *slot;
+    lv_obj_t *halo;
     lv_obj_t *tile;
     lv_obj_t *image;
 
-    if (!parent) {
+    if (!parent || index >= GAME_SELECT_ITEM_COUNT) {
         return NULL;
     }
-    tile = lv_obj_create(parent);
+
+    slot = lv_obj_create(parent);
+    if (!slot) {
+        game_ui_port_log_i(TAG, "创建游戏图标槽失败");
+        return NULL;
+    }
+    lv_obj_set_size(slot, GAME_SELECT_TILE_IDLE_PX, GAME_SELECT_TILE_IDLE_PX);
+    lv_obj_set_style_bg_opa(slot, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(slot, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(slot, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(slot, 0, LV_PART_MAIN);
+    lv_obj_remove_flag(slot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(slot, LV_OBJ_FLAG_CLICKABLE);
+
+    /* 青色半透明柔光环, 仅选中时显示. */
+    halo = lv_obj_create(slot);
+    if (!halo) {
+        game_ui_port_log_i(TAG, "创建柔光失败");
+        return NULL;
+    }
+    lv_obj_set_size(halo, GAME_SELECT_TILE_FOCUS_PX + GAME_SELECT_HALO_PAD_PX,
+                    GAME_SELECT_TILE_FOCUS_PX + GAME_SELECT_HALO_PAD_PX);
+    lv_obj_center(halo);
+    lv_obj_set_style_radius(halo, 10, LV_PART_MAIN);
+    lv_obj_set_style_border_width(halo, 0, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(halo, lv_color_hex(GAME_UI_COLOR_ACCENT),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(halo, LV_OPA_30, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(halo, 22, LV_PART_MAIN);
+    lv_obj_set_style_shadow_spread(halo, 4, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(halo, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_set_style_shadow_color(halo, lv_color_hex(GAME_UI_COLOR_ACCENT),
+                                  LV_PART_MAIN);
+    lv_obj_add_flag(halo, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(halo, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(halo, LV_OBJ_FLAG_SCROLLABLE);
+
+    tile = lv_obj_create(slot);
     if (!tile) {
         game_ui_port_log_i(TAG, "创建游戏图标失败");
         return NULL;
     }
-    lv_obj_set_size(tile, GAME_SELECT_TILE_PX, GAME_SELECT_TILE_PX);
+    lv_obj_set_size(tile, GAME_SELECT_TILE_IDLE_PX, GAME_SELECT_TILE_IDLE_PX);
+    lv_obj_center(tile);
     lv_obj_set_style_bg_color(tile, lv_color_hex(GAME_UI_COLOR_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(tile, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(tile, 6, LV_PART_MAIN);
     lv_obj_set_style_pad_all(tile, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(tile, 2, LV_PART_MAIN);
-    lv_obj_set_style_border_color(tile, lv_color_hex(GAME_UI_COLOR_BUTTON),
+    lv_obj_set_style_border_width(tile, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(tile, lv_color_hex(GAME_UI_COLOR_BUTTON_IDLE),
                                   LV_PART_MAIN);
     lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_remove_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
@@ -152,15 +242,24 @@ static lv_obj_t *game_select_make_tile(lv_obj_t *parent, const lv_image_dsc_t *i
     image = lv_image_create(tile);
     if (!image || !icon) {
         game_ui_port_log_i(TAG, "创建游戏图标图像失败");
-        return tile;
+        s_select_slots[index] = slot;
+        s_select_halos[index] = halo;
+        s_select_tiles[index] = tile;
+        s_select_images[index] = image;
+        return slot;
     }
     lv_obj_remove_style_all(image);
-    lv_obj_set_size(image, GAME_SELECT_ICON_PX, GAME_SELECT_ICON_PX);
+    lv_obj_set_size(image, GAME_SELECT_ICON_IDLE_PX, GAME_SELECT_ICON_IDLE_PX);
     lv_obj_center(image);
     lv_image_set_antialias(image, false);
     lv_image_set_inner_align(image, LV_IMAGE_ALIGN_STRETCH);
     lv_image_set_src(image, icon);
-    return tile;
+
+    s_select_slots[index] = slot;
+    s_select_halos[index] = halo;
+    s_select_tiles[index] = tile;
+    s_select_images[index] = image;
+    return slot;
 }
 
 /**
@@ -170,9 +269,7 @@ static lv_obj_t *game_select_make_tile(lv_obj_t *parent, const lv_image_dsc_t *i
  */
 static void game_select_create(void)
 {
-    lv_obj_t *title;
     lv_obj_t *row;
-    lv_obj_t *hint;
     static lv_event_cb_t clicked[GAME_SELECT_ITEM_COUNT] = {
         game_select_snake_clicked,
         game_select_maze_clicked,
@@ -186,16 +283,11 @@ static void game_select_create(void)
         return;
     }
     game_ui_set_screen_style(s_select_screen);
-    lv_obj_set_style_pad_all(s_select_screen, 12, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_select_screen, 10, LV_PART_MAIN);
     lv_obj_set_flex_flow(s_select_screen, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_select_screen, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(s_select_screen, 14, LV_PART_MAIN);
-
-    title = game_ui_make_label(s_select_screen, "选择游戏", GAME_UI_COLOR_ACCENT,
-                               game_ui_font_title());
-    lv_obj_set_width(title, lv_pct(100));
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(s_select_screen, 10, LV_PART_MAIN);
 
     row = lv_obj_create(s_select_screen);
     if (!row) {
@@ -203,31 +295,29 @@ static void game_select_create(void)
         return;
     }
     lv_obj_set_width(row, lv_pct(100));
-    lv_obj_set_height(row, GAME_SELECT_TILE_PX);
+    lv_obj_set_height(row, GAME_SELECT_SLOT_FOCUS_PX);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row, 16, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(row, 10, LV_PART_MAIN);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     for (i = 0U; i < GAME_SELECT_ITEM_COUNT; ++i) {
-        s_select_tiles[i] =
-            game_select_make_tile(row, s_select_icons[i], clicked[i]);
+        if (!game_select_make_slot(row, s_select_icons[i], clicked[i], i)) {
+            game_ui_port_log_i(TAG, "图标槽 %u 创建失败", (unsigned)i);
+        }
     }
 
-    s_select_name = game_ui_make_label(s_select_screen, s_select_names[0],
-                                       GAME_UI_COLOR_TEXT, game_ui_font_title());
+    s_select_name = game_ui_make_label(
+        s_select_screen,
+        s_select_names[(s_select_index < GAME_SELECT_ITEM_COUNT) ? s_select_index
+                                                                 : 0U],
+        GAME_UI_COLOR_TEXT, game_ui_font_title());
     lv_obj_set_width(s_select_name, lv_pct(100));
     lv_obj_set_style_text_align(s_select_name, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-
-    hint = game_ui_make_label(s_select_screen, "方向键选中, K5 进入",
-                              GAME_UI_COLOR_ACCENT, game_ui_font_body());
-    lv_obj_set_width(hint, lv_pct(100));
-    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    s_select_index = 0U;
     game_select_refresh_focus();
 }
 
@@ -244,13 +334,12 @@ void game_select_ui_init(game_select_choose_cb_t on_choose)
 }
 
 /**
- * @brief 进入选择页, 复位选中项并请求重绘.
+ * @brief 进入选择页并请求重绘, 保留上次选中的游戏.
  *
  * @return 无.
  */
 void game_select_ui_enter(void)
 {
-    s_select_index = 0U;
     game_ui_request_render();
 }
 

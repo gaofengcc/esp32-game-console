@@ -5,10 +5,12 @@ idf_component_register(
         "game_select_ui.c"
         "snake_ui.c"
         "maze_ui.c"
+        "klotski_ui.c"
         "game_ui_port_esp.c"
         "../../game/snake_logic.c"
         "../../game/maze_logic.c"
         "../../game/maze_gen.c"
+        "../../game/klotski_logic.c"
     INCLUDE_DIRS
         "include"
         "../../game"
