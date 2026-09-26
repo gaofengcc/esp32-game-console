@@ -26,6 +26,15 @@
 #define AD_KEYS_DEFAULT_LONG_MS 800
 #define AD_KEYS_DEFAULT_REPEAT_MS 150
 #define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
+#ifndef AD_KEYS_LOG_PERIOD_MS
+#define AD_KEYS_LOG_PERIOD_MS 100U
+#endif
+#ifndef AD_KEYS_LOG_DELTA_MV
+#define AD_KEYS_LOG_DELTA_MV 100U
+#endif
+#ifndef AD_KEYS_LOG_HEARTBEAT_MS
+#define AD_KEYS_LOG_HEARTBEAT_MS 30000U
+#endif
 
 typedef struct {
     uint32_t version;
@@ -74,6 +83,11 @@ typedef struct {
     uint16_t last_voltage_mv;
     uint16_t last_raw_voltage_mv;
     uint32_t last_log_ms;
+    uint16_t last_logged_voltage_mv;
+    uint8_t last_logged_key;
+    uint32_t last_heartbeat_ms;
+    bool log_has_previous;
+    bool log_event_pending;
     bool boot_force_pending;
     uint32_t boot_force_deadline_ms;
 } ad_keys_ctx_t;
@@ -144,9 +158,10 @@ static uint16_t push_and_get_median(uint16_t value)
 static void emit_event(ad_keys_event_type_t type, uint8_t key, uint16_t voltage, uint32_t held)
 {
     ad_keys_event_cb_t cb = s_ctx.cfg.event_cb;
-    if (!cb || key == 0 || key > AD_KEYS_COUNT) {
+    if (key == 0 || key > AD_KEYS_COUNT) {
         return;
     }
+    s_ctx.log_event_pending = true;
     ad_keys_event_t event = {
         .key = key,
         .type = type,
@@ -158,7 +173,9 @@ static void emit_event(ad_keys_event_type_t type, uint8_t key, uint16_t voltage,
              type == AD_KEYS_EVENT_LONG ? "LONG" :
              type == AD_KEYS_EVENT_REPEAT ? "REPEAT" : "RELEASE",
              voltage, (unsigned)held);
-    cb(&event, s_ctx.cfg.event_user_ctx);
+    if (cb) {
+        cb(&event, s_ctx.cfg.event_user_ctx);
+    }
 }
 
 static uint8_t classify_voltage(uint16_t voltage_mv)
@@ -450,6 +467,36 @@ static esp_err_t read_voltage_mv(uint16_t *voltage_mv)
     return ESP_OK;
 }
 
+static void maybe_log_sample(uint32_t tick_ms, uint16_t raw_mv, uint16_t filtered_mv)
+{
+    bool interval_due = !s_ctx.log_has_previous ||
+                        (tick_ms - s_ctx.last_log_ms) >= AD_KEYS_LOG_PERIOD_MS;
+    if (!interval_due) {
+        return;
+    }
+
+    bool value_changed = !s_ctx.log_has_previous ||
+                         abs_diff_u16(filtered_mv, s_ctx.last_logged_voltage_mv) >=
+                             AD_KEYS_LOG_DELTA_MV;
+    bool key_changed = !s_ctx.log_has_previous ||
+                       s_ctx.current_key != s_ctx.last_logged_key;
+    bool heartbeat_due = AD_KEYS_LOG_HEARTBEAT_MS != 0U &&
+                         (!s_ctx.log_has_previous ||
+                          (tick_ms - s_ctx.last_heartbeat_ms) >= AD_KEYS_LOG_HEARTBEAT_MS);
+    if (!value_changed && !key_changed && !s_ctx.log_event_pending && !heartbeat_due) {
+        return;
+    }
+
+    ESP_LOGI(AD_KEYS_TAG, "ADC raw=%umV filtered=%umV key=%u",
+             raw_mv, filtered_mv, s_ctx.current_key);
+    s_ctx.last_log_ms = tick_ms;
+    s_ctx.last_logged_voltage_mv = filtered_mv;
+    s_ctx.last_logged_key = s_ctx.current_key;
+    s_ctx.last_heartbeat_ms = tick_ms;
+    s_ctx.log_has_previous = true;
+    s_ctx.log_event_pending = false;
+}
+
 static void ad_keys_task(void *arg)
 {
     (void)arg;
@@ -501,11 +548,7 @@ static void ad_keys_task(void *arg)
             } else {
                 process_key(filtered, tick_ms);
             }
-            if (tick_ms - s_ctx.last_log_ms >= 500U) {
-                s_ctx.last_log_ms = tick_ms;
-                ESP_LOGI(AD_KEYS_TAG, "ADC raw=%umV filtered=%umV key=%u",
-                         s_ctx.last_raw_voltage_mv, filtered, s_ctx.current_key);
-            }
+            maybe_log_sample(tick_ms, s_ctx.last_raw_voltage_mv, filtered);
         }
         vTaskDelay(period);
     }
