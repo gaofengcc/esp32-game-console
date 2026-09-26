@@ -255,3 +255,134 @@ bootloader.bin         21632 bytes    sha256=a66c6b2bc83778f4a61dc9e4ef8a008fc93
 ota_data_initial.bin   8192 bytes     sha256=7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f
 ```
 模拟器自测 22 项全 PASS（未破坏游戏逻辑）。
+
+## P9 验收（2026-09-26）
+
+### 任务 1：扭动振幅定档 3px
+
+- `source/idf/game_ui/game_ui.c:45`：
+  `GAME_UI_WIGGLE_AMPLITUDE_PX` 已从 `2` 改为 `3`。
+- `GAME_UI_WIGGLE_ENABLE=1`、`GAME_UI_WIGGLE_UPDATE_MS=50U`、
+  `GAME_UI_WIGGLE_CYCLE_MS=1200U`、`GAME_UI_WIGGLE_SEGMENT_PHASE_DEG=42`
+  均保持不变。
+- 注释和 README 均注明：默认 3px 由用户于 2026-09-26 拍板。
+- 提交：
+  - `c1a3b3d2a0ff1b77e6cce6585e1c75e08ab2dc52`
+    `fix: set default wiggle amplitude to 3px`
+  - `6f8aa11c276af9f8df8806b902dd03d7c0667830`
+    `docs: record 3px wiggle amplitude decision`
+
+### 任务 2：截图 BMP host 自测
+
+- 将 RGB565 → 24 位 BGR bottom-up BMP 的纯函数抽到：
+  `source/idf/lvgl_port/lvgl_bmp_encoder.c/.h`。
+- 设备侧 `source/idf/lvgl_port/lvgl_port.c` 继续使用该函数，并保留
+  PSRAM 优先分配；模拟器直接共编译设备侧
+  `../source/idf/lvgl_port/lvgl_bmp_encoder.c`。
+- `simulator/snake_sim.c --selftest` 新增 6 项截图断言：
+  BMP 头、内容有效性、同场景确定性、menu/game 区分、10 次重复调用、
+  行 padding；失败时返回非 0。
+- 未在共享代码中加入 `SIMULATOR` 条件分支。
+- 截图自测完整日志：
+  `/home/gaofeng/code/esp32-game-console/output/sim/p9_selftest.log`
+
+实际命令：
+
+```text
+cmake -S simulator -B simulator/build -DCONFIG_LV_BUILD_DEMOS=OFF -DCONFIG_LV_BUILD_EXAMPLES=OFF
+cmake --build simulator/build -j2
+SDL_VIDEODRIVER=dummy ./simulator/build/snake_sim --selftest
+```
+
+原始自测输出（28 项全 PASS）：
+
+```text
+I (game_ui) 贪吃蛇 UI 已初始化，棋盘 30x18
+PASS logic_forward_step
+PASS logic_reverse_ignored
+PASS logic_force_food
+PASS logic_eat_food_score
+PASS logic_speed_every_5
+PASS logic_pause
+PASS logic_wrap_enabled
+PASS logic_wrap_disabled
+PASS logic_wall_collision
+PASS logic_self_collision
+PASS logic_high_score_read_write
+PASS shot_bmp_header
+PASS shot_content_valid
+PASS shot_same_scene_deterministic
+PASS shot_different_scene
+PASS shot_repeat_10x
+PASS shot_row_padding
+PASS menu_visible
+PASS menu_to_start
+PASS wiggle_phase_advances
+PASS wiggle_offset_bounded
+PASS pause
+PASS resume
+PASS force_food
+PASS eat_food_score
+PASS self_collision_game_over
+PASS retry
+PASS end_to_menu
+```
+
+共用链路证据：
+
+```text
+simulator/CMakeLists.txt:
+    ../source/idf/game_ui/game_ui.c
+    ../source/game/snake_logic.c
+    ../source/idf/lvgl_port/lvgl_bmp_encoder.c
+source/idf/lvgl_port/CMakeLists.txt:
+    "lvgl_port.c"
+    "lvgl_bmp_encoder.c"
+```
+
+`nm -C simulator/build/snake_sim | grep -E 'lvgl_bmp_encode_rgb565|game_ui_(init|update|render_)'`：
+
+```text
+000000000000a726 T game_ui_init
+0000000000009fcf t game_ui_render_current
+0000000000009ea9 t game_ui_render_end
+0000000000009c79 t game_ui_render_game
+0000000000008e47 t game_ui_render_menu
+000000000000a3e1 T game_ui_update
+0000000000009b0d t game_ui_update_board
+0000000000009a46 t game_ui_update_decorations
+000000000000a2ce t game_ui_update_lvgl
+00000000000095ff t game_ui_update_snake
+000000000000bd89 T lvgl_bmp_encode_rgb565
+```
+
+- 截图自测提交：`976d6e0`
+  `test: add shared BMP screenshot selftest`
+
+### 固件构建
+
+命令：
+
+```text
+./build_esp32.sh
+```
+
+结果：ESP-IDF `/home/gaofeng/esp/esp-idf-v5.3.5` 构建成功。
+本轮脚本只复制分散镜像和 `flash_args`，未生成新的 merged 包，也未烧录。
+
+实测 `stat` + `sha256sum`：
+
+| 文件 | 字节数 | SHA256 |
+|---|---:|---|
+| `/home/gaofeng/code/esp32-game-console/output/bootloader.bin` | 21632 | `a66c6b2bc83778f4a61dc9e4ef8a008fc9352463d0dc8c5c72189a0fec10e123` |
+| `/home/gaofeng/code/esp32-game-console/output/partition-table.bin` | 3072 | `6bc0d8697425bf7d469976984c9a127f85b0b80983dd77fc27f47445756f9906` |
+| `/home/gaofeng/code/esp32-game-console/output/ota_data_initial.bin` | 8192 | `7d2c7ac4888bfd75cd5f56e8d61f69595121183afc81556c876732fd3782c62f` |
+| `/home/gaofeng/code/esp32-game-console/output/esp32_game_console.bin` | 1362640 | `4b15b70ac4e46200c8173721228620878c4e442fbec535819f121f3b65ca1362` |
+| `/home/gaofeng/code/esp32-game-console/output/esp32_game_console_merged.bin`（既有文件，本轮未生成/未修改） | 769520 | `388b5829275bdde05a4d87b8e8618bfce0401050316f79a025d53d380338fc65` |
+
+### 遗留风险
+
+- 未烧录、未访问 Win10 串口桥，LCD 实机截图和跨 FreeRTOS/LVGL 任务投递仍需台架验证。
+- host 自测覆盖设备侧共享 BMP 编码和真实 UI framebuffer；设备侧
+  `lvgl_port_capture_bmp()` 的实际任务切换/超时路径仍没有在无硬件环境中执行。
+- 工作树中的 `.agent-sync/events.jsonl`、`.agent-sync/status.md` 是状态守护进程自动更新内容，未纳入本 P9 功能提交。
