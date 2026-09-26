@@ -278,13 +278,14 @@ static esp_err_t load_calibration_locked(void)
     err = nvs_get_blob(nvs, AD_KEYS_NVS_KEY, &blob, &size);
     nvs_close(nvs);
     if (err != ESP_OK || size != sizeof(blob) || blob.version != AD_KEYS_NVS_VERSION) {
-        if (err == ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
             if (size == sizeof(blob)) {
-                ESP_LOGW(AD_KEYS_TAG, "标定数据版本无效(%lu)，丢弃并回落到出厂标定",
+                ESP_LOGW(AD_KEYS_TAG, "标定数据读取/版本无效(%s, version=%lu)，丢弃并回落到出厂标定",
+                         esp_err_to_name(err),
                          (unsigned long)blob.version);
             } else {
-                ESP_LOGW(AD_KEYS_TAG, "标定数据长度无效(%u)，丢弃并回落到出厂标定",
-                         (unsigned)size);
+                ESP_LOGW(AD_KEYS_TAG, "标定数据读取/长度无效(%s, size=%u)，丢弃并回落到出厂标定",
+                         esp_err_to_name(err), (unsigned)size);
             }
             discard_calibration_blob();
         }
