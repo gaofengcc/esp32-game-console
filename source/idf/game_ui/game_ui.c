@@ -37,12 +37,12 @@ extern const lv_font_t lv_font_cjk_16;
 #define GAME_UI_STATUS_BAR_PX 32U
 #define GAME_UI_BOARD_CELLS (SNAKE_BOARD_WIDTH * SNAKE_BOARD_HEIGHT)
 
-/* 扭动动画参数：默认 2px、50ms 更新一次，即 20Hz。 */
+/* 扭动动画参数：默认 3px（用户 2026-09-26 拍板）、50ms 更新一次，即 20Hz。 */
 #ifndef GAME_UI_WIGGLE_ENABLE
 #define GAME_UI_WIGGLE_ENABLE 1
 #endif
 #ifndef GAME_UI_WIGGLE_AMPLITUDE_PX
-#define GAME_UI_WIGGLE_AMPLITUDE_PX 2
+#define GAME_UI_WIGGLE_AMPLITUDE_PX 3
 #endif
 #ifndef GAME_UI_WIGGLE_UPDATE_MS
 #define GAME_UI_WIGGLE_UPDATE_MS 50U
