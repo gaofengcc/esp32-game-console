@@ -54,15 +54,18 @@ extern const lv_font_t lv_font_cjk_16;
 #define GAME_UI_WIGGLE_SEGMENT_PHASE_DEG 42
 #endif
 
-/* 实体键映射可通过编译选项覆盖。默认 K1 上、K2 下、K3 左、K4 右、K5 暂停。 */
+/*
+ * 实体键到游戏内动作的映射，可通过编译选项覆盖。
+ * 出厂语义：K1 左、K2 上、K3 下、K4 右、K5 确定/暂停。
+ */
 #ifndef GAME_UI_KEY_UP
-#define GAME_UI_KEY_UP 1U
+#define GAME_UI_KEY_UP 2U
 #endif
 #ifndef GAME_UI_KEY_DOWN
-#define GAME_UI_KEY_DOWN 2U
+#define GAME_UI_KEY_DOWN 3U
 #endif
 #ifndef GAME_UI_KEY_LEFT
-#define GAME_UI_KEY_LEFT 3U
+#define GAME_UI_KEY_LEFT 1U
 #endif
 #ifndef GAME_UI_KEY_RIGHT
 #define GAME_UI_KEY_RIGHT 4U
@@ -70,6 +73,16 @@ extern const lv_font_t lv_font_cjk_16;
 #ifndef GAME_UI_KEY_PAUSE
 #define GAME_UI_KEY_PAUSE 5U
 #endif
+
+/*
+ * 菜单仍保留现有三个直接快捷键，避免扩大 UI 改动面：
+ * K1 开始、K2 切换速度、K3 切换穿墙；K5 在结束页返回首页。
+ * 游戏页则严格按上面的方向/暂停映射处理。
+ */
+#define GAME_UI_MENU_START_KEY GAME_UI_KEY_LEFT
+#define GAME_UI_MENU_SPEED_KEY GAME_UI_KEY_UP
+#define GAME_UI_MENU_WRAP_KEY GAME_UI_KEY_DOWN
+#define GAME_UI_END_RETRY_KEY GAME_UI_KEY_LEFT
 
 /* 菜单/状态栏上的键位提示集中定义，后续改键位只需要改这里。 */
 #define GAME_UI_KEY1_TEXT "K1"
@@ -924,13 +937,13 @@ static void game_ui_process_key_event(const game_ui_key_event_t *item)
         return;
     }
     if (s_page == GAME_UI_PAGE_MENU) {
-        if (item->key == GAME_UI_KEY_UP) {
+        if (item->key == GAME_UI_MENU_START_KEY) {
             game_ui_start_game();
-        } else if (item->key == GAME_UI_KEY_DOWN) {
+        } else if (item->key == GAME_UI_MENU_SPEED_KEY) {
             s_speed_level = (uint8_t)((s_speed_level + 1U) % 3U);
             snake_game_set_speed_level(&s_game, s_speed_level);
             s_render_pending = true;
-        } else if (item->key == GAME_UI_KEY_LEFT) {
+        } else if (item->key == GAME_UI_MENU_WRAP_KEY) {
             s_wrap_enabled = !s_wrap_enabled;
             snake_game_set_wrap(&s_game, s_wrap_enabled);
             s_render_pending = true;
@@ -938,7 +951,7 @@ static void game_ui_process_key_event(const game_ui_key_event_t *item)
         return;
     }
     if (s_page == GAME_UI_PAGE_END) {
-        if (item->key == GAME_UI_KEY_UP) {
+        if (item->key == GAME_UI_END_RETRY_KEY) {
             game_ui_retry_game();
         } else if (item->key == GAME_UI_KEY_PAUSE) {
             s_page = GAME_UI_PAGE_MENU;

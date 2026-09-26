@@ -186,14 +186,14 @@ static void advance_ms(uint32_t elapsed_ms)
 
 static uint8_t parse_key(const char *token)
 {
-    if (!strcmp(token, "K1") || !strcmp(token, "UP") ||
+    if (!strcmp(token, "K1") || !strcmp(token, "LEFT") ||
         !strcmp(token, "START") || !strcmp(token, "RETRY")) {
         return 1;
     }
-    if (!strcmp(token, "K2") || !strcmp(token, "DOWN")) {
+    if (!strcmp(token, "K2") || !strcmp(token, "UP")) {
         return 2;
     }
-    if (!strcmp(token, "K3") || !strcmp(token, "LEFT")) {
+    if (!strcmp(token, "K3") || !strcmp(token, "DOWN")) {
         return 3;
     }
     if (!strcmp(token, "K4") || !strcmp(token, "RIGHT")) {
@@ -640,20 +640,20 @@ static int run_scene(const char *scene, const char *keys, int steps,
         inject_token("START");
     } else if (scene && !strcmp(scene, "head_up")) {
         inject_token("START");
-        inject_token("K1");
+        inject_token("K2");
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     } else if (scene && !strcmp(scene, "head_down")) {
         inject_token("START");
-        inject_token("K2");
+        inject_token("K3");
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     } else if (scene && !strcmp(scene, "head_left")) {
         inject_token("START");
-        inject_token("K1");
+        inject_token("K2");
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
-        inject_token("K3");
+        inject_token("K1");
         state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     } else if (scene && !strcmp(scene, "ate")) {
