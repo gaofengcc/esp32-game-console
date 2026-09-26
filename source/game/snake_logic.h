@@ -61,6 +61,14 @@ typedef enum {
     SNAKE_SPEED_LEVEL_FAST,
 } snake_speed_level_t;
 
+/* 游戏结束原因仅用于 UI 提示，不改变原有规则。 */
+typedef enum {
+    SNAKE_GAME_OVER_NONE = 0,
+    SNAKE_GAME_OVER_SELF_COLLISION,
+    SNAKE_GAME_OVER_WALL,
+    SNAKE_GAME_OVER_BOARD_FULL,
+} snake_game_over_reason_t;
+
 typedef int (*snake_score_load_fn)(void *ctx, int *score);
 typedef int (*snake_score_save_fn)(void *ctx, int score);
 
@@ -87,6 +95,7 @@ typedef struct {
     bool game_over;
     bool paused;
     uint32_t foods_eaten;
+    snake_game_over_reason_t game_over_reason;
 } snake_state_t;
 
 typedef struct {
@@ -99,7 +108,7 @@ typedef struct {
     bool food_valid;
 } snake_game_t;
 
-/* 生成默认配置：30x20、慢速 260ms、默认穿墙。 */
+/* 生成默认配置：30x18、慢速 260ms、默认穿墙。 */
 void snake_config_default(snake_config_t *config);
 
 /* 初始化并读取最高分；初始化后状态为 READY，调用 reset 开始游戏。 */
@@ -128,6 +137,7 @@ bool snake_game_force_food(snake_game_t *game, snake_point_t food);
 /* 额外查询/配置接口，便于设备 UI 使用。 */
 snake_status_t snake_game_get_status(const snake_game_t *game);
 snake_direction_t snake_game_get_direction(const snake_game_t *game);
+snake_game_over_reason_t snake_game_get_over_reason(const snake_game_t *game);
 uint16_t snake_game_get_speed_ms(const snake_game_t *game);
 void snake_game_set_wrap(snake_game_t *game, bool enabled);
 void snake_game_set_speed_level(snake_game_t *game, snake_speed_level_t level);

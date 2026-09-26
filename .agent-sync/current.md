@@ -116,3 +116,49 @@
 - 未烧录、未接 Win10 串口桥，LCD 实机刷新、触摸校准和 AD 电压阈值仍未做硬件验证。
 - UI 字库是本地 Source Han Sans SC 的文案子集；后续新增中文文案必须同步扩展字库生成脚本/资源。
 - `game_ui_force_food`、`game_ui_force_self_collision` 是仿真/冒烟测试辅助接口，若后续要收紧设备公共 API，可迁移到独立测试适配层。
+
+## P2 儿童向 UI 最终验收（2026-09-26）
+
+### 模拟器与测试
+
+- 棋盘保持 `30x18`、每格 `16px`，屏幕保持 `480x320`。
+- `cmake -S simulator -B simulator/build -DCONFIG_LV_BUILD_DEMOS=OFF -DCONFIG_LV_BUILD_EXAMPLES=OFF`
+- `cmake --build simulator/build -j2`：通过。
+- `SDL_VIDEODRIVER=dummy ./simulator/build/snake_test --selftest`：20 项全 PASS（逻辑 11 项 + UI 冒烟 9 项）。
+- 完整输出记录：`/home/gaofeng/code/esp32-game-console/output/sim/snake_test_final.log`。
+- 逻辑测试覆盖：前进、反向忽略、强制食物、吃食物计分、每 5 个食物提速、暂停、穿墙开、穿墙关、撞墙、撞自己、最高分读写。
+- 方向验收场景：`head_right`、`head_up`、`head_down`、`head_left`；左转场景按 `START→K1→推进1步→K3→推进1步` 注入。
+
+### 真实模拟器截图（均为 480x320）
+
+- `/home/gaofeng/code/esp32-game-console/output/sim/accept_menu.png`
+- `/home/gaofeng/code/esp32-game-console/output/sim/accept_game.png`
+- `/home/gaofeng/code/esp32-game-console/output/sim/accept_ate.png`
+- `/home/gaofeng/code/esp32-game-console/output/sim/accept_paused.png`
+- `/home/gaofeng/code/esp32-game-console/output/sim/accept_end_self.png`
+- `/home/gaofeng/code/esp32-game-console/output/sim/accept_head_directions.png`
+
+### 最终设备构建产物
+
+- `/home/gaofeng/code/esp32-game-console/output/esp32_game_console.bin`：689552 bytes，SHA256 `5d6a71719847ee863559ff449c22eeadfbc10f7faafb21ff4fdb83874c587056`
+- `/home/gaofeng/code/esp32-game-console/output/esp32_game_console_merged.bin`：755088 bytes，SHA256 `f71dfdb7733f00095c54f06ef6d5738b286fa3c144ff11c4e1a62db01bb7e798`
+- merged 仅包含 bootloader、partition-table、factory app，不包含 `otadata`，大小远小于 NVS 起始地址 `0x500000`。
+
+### 保护约束
+
+- 未烧录、未调用 Win10 串口桥，未修改 `Nas-assistant`、`esp32-lab-bridge` 或 `LCD_Drivers`。
+
+### P3 视觉与刷新补充
+
+| 颜色宏 | 修改前 | 修改后 |
+|---|---:|---:|
+| `COLOR_GRID` | `0x1D3038` | `0x141E26` |
+| `COLOR_SNAKE_HEAD` | `0x66BB6A` | `0xAEEA00` |
+| `COLOR_SNAKE_BODY` | `0x2E8B57` | `0x2E8B57` |
+| `COLOR_FOOD` | `0xEF5350` | `0xEF5350` |
+| 新增 `COLOR_EYE` | - | `0x18332B` |
+| 新增 `COLOR_FOOD_GLINT` | - | `0xFFF8E1` |
+
+- 键位提示宏位于 `source/idf/game_ui/game_ui.c` 顶部：`GAME_UI_KEY1_TEXT`、`GAME_UI_KEY2_TEXT`、`GAME_UI_KEY3_TEXT`、`GAME_UI_KEY5_TEXT`。
+- `game_ui.c` 保持局部刷新：运行中只比较并重绘变化格子；状态栏分数/最高分仅在数值变化时更新；新局/重试才做一次棋盘全量失效。
+- 吃食物动画只作用于单个得分标签，时长 `130ms + 130ms = 260ms`，没有整屏动画。

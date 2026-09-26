@@ -205,6 +205,192 @@ static int check_item(const char *name, int ok)
     return ok;
 }
 
+typedef struct {
+    int stored;
+    int saves;
+} logic_score_store_t;
+
+static int logic_score_load(void *ctx, int *score)
+{
+    logic_score_store_t *store = (logic_score_store_t *)ctx;
+    if (!store || !score) {
+        return -1;
+    }
+    *score = store->stored;
+    return 0;
+}
+
+static int logic_score_save(void *ctx, int score)
+{
+    logic_score_store_t *store = (logic_score_store_t *)ctx;
+    if (!store) {
+        return -1;
+    }
+    store->stored = score;
+    ++store->saves;
+    return 0;
+}
+
+static void logic_init_game(snake_game_t *game)
+{
+    snake_config_t config;
+    snake_config_default(&config);
+    snake_game_init(game, &config);
+    snake_game_reset(game);
+}
+
+static snake_point_t logic_next_right(const snake_game_t *game)
+{
+    const snake_state_t *state = snake_game_state(game);
+    snake_point_t next = state->segments[0];
+    next.x = (uint8_t)((next.x + 1U) % state->width);
+    return next;
+}
+
+/* 逻辑层回归：11 项断言覆盖移动、碰撞、计分、速度、穿墙和最高分。 */
+static int selftest_logic(void)
+{
+    int all = 1;
+    snake_game_t game;
+    const snake_state_t *state;
+
+    logic_init_game(&game);
+    snake_point_t before = game.state.segments[0];
+    bool moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item(
+        "logic_forward_step",
+        moved && state->segments[0].x ==
+                       (uint8_t)((before.x + 1U) % state->width) &&
+            state->segments[0].y == before.y);
+
+    logic_init_game(&game);
+    before = game.state.segments[0];
+    snake_game_set_input(&game, SNAKE_INPUT_LEFT);
+    moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item(
+        "logic_reverse_ignored",
+        moved && snake_game_get_direction(&game) == SNAKE_DIRECTION_RIGHT &&
+            state->segments[0].x ==
+                (uint8_t)((before.x + 1U) % state->width));
+
+    logic_init_game(&game);
+    snake_point_t forced_food = {0, 0};
+    bool forced = snake_game_force_food(&game, forced_food);
+    state = snake_game_state(&game);
+    all &= check_item("logic_force_food",
+                      forced && state->food.x == forced_food.x &&
+                          state->food.y == forced_food.y);
+
+    logic_init_game(&game);
+    forced_food = logic_next_right(&game);
+    forced = snake_game_force_food(&game, forced_food);
+    moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item("logic_eat_food_score",
+                      forced && moved && state->score == 10 &&
+                          state->length == 4 && state->foods_eaten == 1);
+
+    logic_init_game(&game);
+    for (int i = 0; i < 5; ++i) {
+        forced_food = logic_next_right(&game);
+        if (!snake_game_force_food(&game, forced_food) ||
+            !snake_game_step(&game)) {
+            break;
+        }
+    }
+    state = snake_game_state(&game);
+    all &= check_item("logic_speed_every_5",
+                      state->foods_eaten == 5 && state->score == 50 &&
+                          state->speed_ms == SNAKE_SPEED_SLOW_MS - 10U);
+
+    logic_init_game(&game);
+    before = game.state.segments[0];
+    snake_game_set_input(&game, SNAKE_INPUT_PAUSE);
+    bool paused = game.state.paused;
+    bool blocked = !snake_game_step(&game) &&
+                   game.state.segments[0].x == before.x &&
+                   game.state.segments[0].y == before.y;
+    snake_game_set_input(&game, SNAKE_INPUT_PAUSE);
+    bool resumed = !game.state.paused && snake_game_step(&game);
+    all &= check_item("logic_pause", paused && blocked && resumed);
+
+    logic_init_game(&game);
+    game.state.segments[0].x = (uint8_t)(game.state.width - 1U);
+    game.state.segments[1].x = (uint8_t)(game.state.width - 2U);
+    game.state.segments[2].x = (uint8_t)(game.state.width - 3U);
+    game.direction = SNAKE_DIRECTION_RIGHT;
+    game.pending_direction = SNAKE_DIRECTION_RIGHT;
+    snake_game_set_wrap(&game, true);
+    moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item("logic_wrap_enabled",
+                      moved && !state->game_over && state->segments[0].x == 0);
+
+    logic_init_game(&game);
+    before = game.state.segments[0];
+    snake_game_set_wrap(&game, false);
+    moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item(
+        "logic_wrap_disabled",
+        !state->wrap_walls && moved && !state->game_over &&
+            state->segments[0].x ==
+                (uint8_t)((before.x + 1U) % state->width));
+
+    logic_init_game(&game);
+    game.state.segments[0].x = (uint8_t)(game.state.width - 1U);
+    game.state.segments[1].x = (uint8_t)(game.state.width - 2U);
+    game.state.segments[2].x = (uint8_t)(game.state.width - 3U);
+    game.direction = SNAKE_DIRECTION_RIGHT;
+    game.pending_direction = SNAKE_DIRECTION_RIGHT;
+    snake_game_set_wrap(&game, false);
+    moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item("logic_wall_collision",
+                      !moved && state->game_over &&
+                          snake_game_get_over_reason(&game) ==
+                              SNAKE_GAME_OVER_WALL);
+
+    logic_init_game(&game);
+    game.state.length = 4;
+    game.state.segments[0] = (snake_point_t){5, 5};
+    game.state.segments[1] = (snake_point_t){4, 5};
+    game.state.segments[2] = (snake_point_t){4, 4};
+    game.state.segments[3] = (snake_point_t){5, 4};
+    game.direction = SNAKE_DIRECTION_LEFT;
+    game.pending_direction = SNAKE_DIRECTION_LEFT;
+    (void)snake_game_force_food(&game, (snake_point_t){0, 0});
+    moved = snake_game_step(&game);
+    state = snake_game_state(&game);
+    all &= check_item("logic_self_collision",
+                      !moved && state->game_over &&
+                          snake_game_get_over_reason(&game) ==
+                              SNAKE_GAME_OVER_SELF_COLLISION);
+
+    logic_score_store_t store = {0, 0};
+    snake_config_t config;
+    snake_config_default(&config);
+    config.load_best = logic_score_load;
+    config.save_best = logic_score_save;
+    config.storage_ctx = &store;
+    snake_game_init(&game, &config);
+    snake_game_reset(&game);
+    forced_food = logic_next_right(&game);
+    bool ate = snake_game_force_food(&game, forced_food) &&
+               snake_game_step(&game);
+    snake_game_t loaded;
+    snake_game_init(&loaded, &config);
+    state = snake_game_state(&game);
+    const snake_state_t *loaded_state = snake_game_state(&loaded);
+    all &= check_item("logic_high_score_read_write",
+                      ate && state->best_score == 10 && store.stored == 10 &&
+                          store.saves == 1 && loaded_state->best_score == 10);
+
+    return all ? 0 : 1;
+}
+
 static int selftest_ui(void)
 {
     int all = 1;
@@ -253,6 +439,26 @@ static int run_scene(const char *scene, const char *keys, int steps,
 {
     if (scene && !strcmp(scene, "game")) {
         inject_token("START");
+    } else if (scene && !strcmp(scene, "head_right")) {
+        inject_token("START");
+    } else if (scene && !strcmp(scene, "head_up")) {
+        inject_token("START");
+        inject_token("K1");
+        const snake_state_t *state = game_ui_get_state();
+        advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
+    } else if (scene && !strcmp(scene, "head_down")) {
+        inject_token("START");
+        inject_token("K2");
+        const snake_state_t *state = game_ui_get_state();
+        advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
+    } else if (scene && !strcmp(scene, "head_left")) {
+        inject_token("START");
+        inject_token("K1");
+        const snake_state_t *state = game_ui_get_state();
+        advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
+        inject_token("K3");
+        state = game_ui_get_state();
+        advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     } else if (scene && !strcmp(scene, "ate")) {
         inject_token("START");
         const snake_state_t *state = game_ui_get_state();
@@ -321,8 +527,14 @@ int main(int argc, char **argv)
     if (init_simulator() != 0) {
         return 1;
     }
-    int rc = self ? selftest_ui()
-                  : run_scene(scene, keys, steps, advance_step_ms);
+    int rc;
+    if (self) {
+        int logic_rc = selftest_logic();
+        int ui_rc = selftest_ui();
+        rc = logic_rc || ui_rc;
+    } else {
+        rc = run_scene(scene, keys, steps, advance_step_ms);
+    }
     if (!rc && shot_path && write_png(shot_path) != 0) {
         rc = 1;
     }

@@ -103,6 +103,14 @@ static void snake_save_best_if_needed(snake_game_t *game)
     }
 }
 
+static void snake_set_game_over(snake_game_t *game,
+                                snake_game_over_reason_t reason)
+{
+    game->state.game_over = true;
+    game->state.game_over_reason = reason;
+    snake_save_best_if_needed(game);
+}
+
 void snake_config_default(snake_config_t *config)
 {
     if (!config) {
@@ -158,6 +166,7 @@ void snake_game_init(snake_game_t *game, const snake_config_t *config)
     snake_game_reload_high_score(game);
     game->state.game_over = false;
     game->state.paused = false;
+    game->state.game_over_reason = SNAKE_GAME_OVER_NONE;
 }
 
 void snake_game_reset(snake_game_t *game)
@@ -183,6 +192,7 @@ void snake_game_reset(snake_game_t *game)
     game->elapsed_ms = 0;
     game->state.game_over = false;
     game->state.paused = false;
+    game->state.game_over_reason = SNAKE_GAME_OVER_NONE;
     snake_refresh_speed(game);
     snake_spawn_food(game);
 }
@@ -223,8 +233,7 @@ bool snake_game_step(snake_game_t *game)
         case SNAKE_DIRECTION_UP:
             if (next.y == 0U) {
                 if (!game->state.wrap_walls) {
-                    game->state.game_over = true;
-                    snake_save_best_if_needed(game);
+                    snake_set_game_over(game, SNAKE_GAME_OVER_WALL);
                     return false;
                 }
                 next.y = (uint8_t)(game->state.height - 1U);
@@ -235,8 +244,7 @@ bool snake_game_step(snake_game_t *game)
         case SNAKE_DIRECTION_DOWN:
             if ((uint16_t)next.y + 1U >= game->state.height) {
                 if (!game->state.wrap_walls) {
-                    game->state.game_over = true;
-                    snake_save_best_if_needed(game);
+                    snake_set_game_over(game, SNAKE_GAME_OVER_WALL);
                     return false;
                 }
                 next.y = 0;
@@ -247,8 +255,7 @@ bool snake_game_step(snake_game_t *game)
         case SNAKE_DIRECTION_LEFT:
             if (next.x == 0U) {
                 if (!game->state.wrap_walls) {
-                    game->state.game_over = true;
-                    snake_save_best_if_needed(game);
+                    snake_set_game_over(game, SNAKE_GAME_OVER_WALL);
                     return false;
                 }
                 next.x = (uint8_t)(game->state.width - 1U);
@@ -260,8 +267,7 @@ bool snake_game_step(snake_game_t *game)
         default:
             if ((uint16_t)next.x + 1U >= game->state.width) {
                 if (!game->state.wrap_walls) {
-                    game->state.game_over = true;
-                    snake_save_best_if_needed(game);
+                    snake_set_game_over(game, SNAKE_GAME_OVER_WALL);
                     return false;
                 }
                 next.x = 0;
@@ -277,8 +283,7 @@ bool snake_game_step(snake_game_t *game)
                  : (game->state.length ? game->state.length - 1U : 0U);
     for (uint16_t i = 0; i < collision_limit; ++i) {
         if (snake_same(game->state.segments[i], next)) {
-            game->state.game_over = true;
-            snake_save_best_if_needed(game);
+            snake_set_game_over(game, SNAKE_GAME_OVER_SELF_COLLISION);
             return false;
         }
     }
@@ -286,8 +291,7 @@ bool snake_game_step(snake_game_t *game)
     uint16_t new_length =
         ate_food ? (uint16_t)(game->state.length + 1U) : game->state.length;
     if (new_length > SNAKE_MAX_SEGMENTS) {
-        game->state.game_over = true;
-        snake_save_best_if_needed(game);
+        snake_set_game_over(game, SNAKE_GAME_OVER_BOARD_FULL);
         return false;
     }
     for (uint16_t i = new_length - 1U; i > 0U; --i) {
@@ -380,6 +384,11 @@ snake_status_t snake_game_get_status(const snake_game_t *game)
 snake_direction_t snake_game_get_direction(const snake_game_t *game)
 {
     return game ? game->direction : SNAKE_DIRECTION_RIGHT;
+}
+
+snake_game_over_reason_t snake_game_get_over_reason(const snake_game_t *game)
+{
+    return game ? game->state.game_over_reason : SNAKE_GAME_OVER_NONE;
 }
 
 uint16_t snake_game_get_speed_ms(const snake_game_t *game)
