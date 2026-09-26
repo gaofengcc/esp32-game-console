@@ -1,0 +1,43 @@
+menu "游戏机 WiFi 与诊断配置"
+
+config USER_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+      编译期配置的 WiFi STA 网络名称，仅用于测试阶段自动连接。
+
+      WiFi 凭据属于敏感信息，只能放在本地 sdkconfig 或
+      sdkconfig.defaults.local（均已加入 gitignore），禁止提交到仓库。
+
+config USER_WIFI_PASSWORD
+    string "WiFi 密码"
+    default ""
+    help
+      编译期配置的 WiFi STA 密码，仅用于测试阶段自动连接。
+
+      WiFi 凭据属于敏感信息，只能放在本地 sdkconfig 或
+      sdkconfig.defaults.local（均已加入 gitignore），禁止提交到仓库。
+
+config GAME_CONSOLE_ENABLE_WIFI
+    bool "启用游戏机 WiFi"
+    default y
+    help
+      启用后，固件以 STA 模式使用上面的编译期凭据连接 WiFi。
+      关闭后完全不初始化或连接 WiFi。
+
+config GAME_CONSOLE_DIAG_PORT
+    int "诊断服务端口"
+    range 1 65535
+    default 8080
+    help
+      局域网诊断服务使用的 HTTP 端口。
+
+config GAME_CONSOLE_DIAG_TOKEN
+    string "诊断服务 Bearer Token"
+    default ""
+    help
+      诊断服务鉴权令牌。留空时由固件启动时随机生成并打印到串口。
+      令牌属于敏感信息，只能放在本地 sdkconfig 或
+      sdkconfig.defaults.local（均已加入 gitignore），禁止提交到仓库。
+
+endmenu
