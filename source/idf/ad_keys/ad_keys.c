@@ -20,11 +20,15 @@
 #define AD_KEYS_SAMPLE_BUF 7
 #define AD_KEYS_NVS_VERSION 1U
 #define AD_KEYS_NVS_KEY "calibration"
-#define AD_KEYS_DEFAULT_PERIOD_MS 10
-#define AD_KEYS_DEFAULT_STABLE 3
-#define AD_KEYS_DEFAULT_DEBOUNCE_MS 25
-#define AD_KEYS_DEFAULT_LONG_MS 800
-#define AD_KEYS_DEFAULT_REPEAT_MS 150
+/* 5ms 采样, 3 点中值, 2 次确认. 防抖大约 10ms, 界面仍 20ms 取键. */
+#define AD_KEYS_DEFAULT_PERIOD_MS 5
+/* 按键任务钉在核 0, 避免优先级 5 抢 LVGL 所在的核 1. */
+#define AD_KEYS_TASK_CORE 0
+#define AD_KEYS_DEFAULT_MEDIAN_WINDOW 3
+#define AD_KEYS_DEFAULT_STABLE 2
+#define AD_KEYS_DEFAULT_DEBOUNCE_MS 5
+#define AD_KEYS_DEFAULT_REPEAT_DELAY_MS 200
+#define AD_KEYS_DEFAULT_REPEAT_MS 50
 #define AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV 160
 /*
  * 运行时按键采样已关闭: 用户看不到提示, 不知道该按哪一颗.
@@ -99,7 +103,6 @@ typedef struct {
     uint8_t current_key;
     uint32_t press_start_ms;
     uint32_t next_repeat_ms;
-    bool long_sent;
 
     uint16_t last_voltage_mv;
     uint16_t last_raw_voltage_mv;
@@ -395,7 +398,6 @@ static void start_calibration_locked(void)
 #if AD_KEYS_ENABLE_RUNTIME_SAMPLING
     s_ctx.calibrating = true;
     s_ctx.current_key = 0;
-    s_ctx.long_sent = false;
     s_ctx.calibration_wait_release = false;
     s_ctx.calibration_index = 0;
     s_ctx.calibration_warned_mask = 0;
@@ -521,24 +523,22 @@ static void process_key(uint16_t voltage_mv, uint32_t tick_ms)
                        tick_ms - s_ctx.press_start_ms);
         }
         s_ctx.current_key = key;
-        s_ctx.long_sent = false;
         if (key != 0) {
             s_ctx.press_start_ms = tick_ms;
-            s_ctx.next_repeat_ms = tick_ms + (uint32_t)s_ctx.cfg.long_press_ms;
+            s_ctx.next_repeat_ms =
+                tick_ms + (uint32_t)s_ctx.cfg.repeat_delay_ms;
             emit_event(AD_KEYS_EVENT_PRESS, key, voltage_mv, 0);
         }
     }
 
-    if (s_ctx.current_key != 0 && key == s_ctx.current_key) {
+    /* 按下后 repeat_delay_ms 开始连发, 不再插入长按事件. */
+    if (s_ctx.current_key != 0 && key == s_ctx.current_key &&
+        tick_ms >= s_ctx.next_repeat_ms) {
         uint32_t held_ms = tick_ms - s_ctx.press_start_ms;
-        if (!s_ctx.long_sent && held_ms >= (uint32_t)s_ctx.cfg.long_press_ms) {
-            s_ctx.long_sent = true;
-            s_ctx.next_repeat_ms = tick_ms + (uint32_t)s_ctx.cfg.repeat_ms;
-            emit_event(AD_KEYS_EVENT_LONG, s_ctx.current_key, voltage_mv, held_ms);
-        } else if (s_ctx.long_sent && tick_ms >= s_ctx.next_repeat_ms) {
-            s_ctx.next_repeat_ms = tick_ms + (uint32_t)s_ctx.cfg.repeat_ms;
-            emit_event(AD_KEYS_EVENT_REPEAT, s_ctx.current_key, voltage_mv, held_ms);
-        }
+
+        s_ctx.next_repeat_ms = tick_ms + (uint32_t)s_ctx.cfg.repeat_ms;
+        emit_event(AD_KEYS_EVENT_REPEAT, s_ctx.current_key, voltage_mv,
+                   held_ms);
     }
 }
 
@@ -659,10 +659,10 @@ void ad_keys_config_default(ad_keys_config_t *config)
     }
     memset(config, 0, sizeof(*config));
     config->sample_period_ms = AD_KEYS_DEFAULT_PERIOD_MS;
-    config->median_window = 5;
+    config->median_window = AD_KEYS_DEFAULT_MEDIAN_WINDOW;
     config->stable_samples = AD_KEYS_DEFAULT_STABLE;
     config->debounce_ms = AD_KEYS_DEFAULT_DEBOUNCE_MS;
-    config->long_press_ms = AD_KEYS_DEFAULT_LONG_MS;
+    config->repeat_delay_ms = AD_KEYS_DEFAULT_REPEAT_DELAY_MS;
     config->repeat_ms = AD_KEYS_DEFAULT_REPEAT_MS;
     config->calibration_idle_delta_mv = AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV;
 }
@@ -679,7 +679,9 @@ esp_err_t ad_keys_init(const ad_keys_config_t *config)
         if (s_ctx.cfg.sample_period_ms <= 0) s_ctx.cfg.sample_period_ms = AD_KEYS_DEFAULT_PERIOD_MS;
         if (s_ctx.cfg.stable_samples <= 0) s_ctx.cfg.stable_samples = AD_KEYS_DEFAULT_STABLE;
         if (s_ctx.cfg.debounce_ms <= 0) s_ctx.cfg.debounce_ms = AD_KEYS_DEFAULT_DEBOUNCE_MS;
-        if (s_ctx.cfg.long_press_ms <= 0) s_ctx.cfg.long_press_ms = AD_KEYS_DEFAULT_LONG_MS;
+        if (s_ctx.cfg.repeat_delay_ms <= 0) {
+            s_ctx.cfg.repeat_delay_ms = AD_KEYS_DEFAULT_REPEAT_DELAY_MS;
+        }
         if (s_ctx.cfg.repeat_ms <= 0) s_ctx.cfg.repeat_ms = AD_KEYS_DEFAULT_REPEAT_MS;
         if (s_ctx.cfg.calibration_idle_delta_mv == 0) {
         s_ctx.cfg.calibration_idle_delta_mv = AD_KEYS_DEFAULT_CALIBRATION_MIN_DELTA_MV;
@@ -737,10 +739,13 @@ esp_err_t ad_keys_start(void)
         return ESP_OK;
     }
     s_ctx.running = true;
-    if (xTaskCreate(ad_keys_task, "ad_keys", 4096, NULL, 5, &s_ctx.task) != pdPASS) {
+    if (xTaskCreatePinnedToCore(ad_keys_task, "ad_keys", 4096, NULL, 5,
+                                &s_ctx.task, AD_KEYS_TASK_CORE) != pdPASS) {
         s_ctx.running = false;
         return ESP_ERR_NO_MEM;
     }
+    ESP_LOGI(AD_KEYS_TAG, "按键任务已钉到核 %d, 优先级 5, 采样 %dms",
+             AD_KEYS_TASK_CORE, s_ctx.cfg.sample_period_ms);
     return ESP_OK;
 }
 

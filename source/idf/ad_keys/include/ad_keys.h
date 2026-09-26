@@ -16,9 +16,9 @@ extern "C" {
 #define AD_KEYS_GPIO 1
 
 typedef enum {
-    AD_KEYS_EVENT_PRESS = 0,   // 按下即触发（短按）
-    AD_KEYS_EVENT_LONG,        // 持续按住达到长按阈值
-    AD_KEYS_EVENT_REPEAT,      // 长按后的连发
+    AD_KEYS_EVENT_PRESS = 0,   // 按下稳定后立即触发, 不等抬起
+    AD_KEYS_EVENT_LONG,        // 保留枚举值, 驱动不再发送
+    AD_KEYS_EVENT_REPEAT,      // 按下后按 repeat_delay_ms 开始, 再按 repeat_ms 连发
     AD_KEYS_EVENT_RELEASE,     // 释放
 } ad_keys_event_type_t;
 
@@ -44,12 +44,12 @@ typedef struct {
 typedef ad_keys_state_t ad_keys_status_t;
 
 typedef struct {
-    int sample_period_ms;      // 默认 10ms（100Hz）
-    int median_window;         // 默认 5，当前仅支持 3/5/7，建议 5
-    int stable_samples;        // 连续多少次同一窗口才确认，默认 3
-    int debounce_ms;           // 去抖时间，默认 25ms
-    int long_press_ms;         // 长按阈值，默认 800ms
-    int repeat_ms;             // 连发周期，默认 150ms
+    int sample_period_ms;      // 默认 5ms
+    int median_window;         // 默认 3, 仅支持 3/5/7
+    int stable_samples;        // 连续多少次同一窗口才确认, 默认 2
+    int debounce_ms;           // 去抖时间, 默认 5ms
+    int repeat_delay_ms;       // 按下后多久发出第一次连发, 默认 200ms
+    int repeat_ms;             // 连发周期, 默认 50ms
     uint16_t calibration_idle_delta_mv; // 标定/强制检测偏离阈值，默认160mV（安全下限）
     ad_keys_event_cb_t event_cb;
     void *event_user_ctx;
