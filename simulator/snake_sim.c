@@ -8,6 +8,9 @@
 
 #include "game_ui.h"
 #include "lvgl_bmp_encoder.h"
+#include "maze_gen.h"
+#include "maze_logic.h"
+#include "maze_ui.h"
 #include "sim_port.h"
 #include "snake_logic.h"
 #include "zlib.h"
@@ -209,6 +212,49 @@ static void inject_token(const char *token)
 {
     sim_port_inject_key(parse_key(token), AD_KEYS_EVENT_PRESS);
     advance_ms(0);
+}
+
+/**
+ * @brief 从游戏选择页进入贪吃蛇对局.
+ */
+static void enter_snake_game(void)
+{
+    inject_token("K5");
+    inject_token("K5");
+}
+
+/**
+ * @brief 从游戏选择页进入指定风格的迷宫对局, 种子固定便于对照截图.
+ *
+ * @param theme 要预览的迷宫风格.
+ * @return 无.
+ */
+static void enter_maze_theme(maze_ui_theme_t theme)
+{
+    maze_ui_set_shot_seed(20260926U);
+    maze_ui_set_theme(theme);
+    inject_token("DOWN");
+    inject_token("K5");
+    inject_token("K5");
+}
+
+/**
+ * @brief 进入指定风格的闯关迷宫, 同时能看到入口玩家和出口守卫.
+ *
+ * @param theme 要预览的迷宫风格.
+ * @return 无.
+ */
+static void enter_maze_challenge_theme(maze_ui_theme_t theme)
+{
+    maze_ui_set_shot_seed(20260926U);
+    maze_ui_set_theme(theme);
+    inject_token("DOWN");
+    inject_token("K5");
+    inject_token("DOWN");
+    inject_token("K5");
+    inject_token("K5");
+    inject_token("UP");
+    inject_token("K5");
 }
 
 static void inject_keys(const char *keys)
@@ -488,9 +534,10 @@ static int selftest_logic(void)
         }
     }
     state = snake_game_state(&game);
-    all &= check_item("logic_speed_every_5",
+    all &= check_item("logic_speed_per_food",
                       state->foods_eaten == 5 && state->score == 50 &&
-                          state->speed_ms == SNAKE_SPEED_SLOW_MS - 10U);
+                          state->speed_ms == (uint16_t)(SNAKE_SPEED_SLOW_MS -
+                                                       (5U * SNAKE_SPEED_PER_FOOD_MS)));
 
     logic_init_game(&game);
     before = game.state.segments[0];
@@ -578,6 +625,465 @@ static int selftest_logic(void)
     return all ? 0 : 1;
 }
 
+static bool maze_can_reach_exit(const maze_game_t *game)
+{
+    const maze_state_t *state = maze_game_state(game);
+    bool visited[MAZE_CELL_COUNT];
+    maze_point_t queue[MAZE_CELL_COUNT];
+    uint16_t head = 0U;
+    uint16_t tail = 0U;
+    const int8_t dx[4] = {0, 0, -1, 1};
+    const int8_t dy[4] = {-1, 1, 0, 0};
+    uint8_t i;
+
+    if (!state) {
+        return false;
+    }
+    memset(visited, 0, sizeof(visited));
+    queue[tail++] = state->entrance;
+    visited[state->entrance.y * MAZE_WIDTH + state->entrance.x] = true;
+    while (head < tail) {
+        maze_point_t cur = queue[head++];
+        if (maze_game_same_point(cur, state->exit_cell)) {
+            return true;
+        }
+        for (i = 0U; i < 4U; ++i) {
+            int16_t nx = (int16_t)cur.x + dx[i];
+            int16_t ny = (int16_t)cur.y + dy[i];
+            uint16_t index;
+            if (nx < 0 || ny < 0 || nx >= (int16_t)MAZE_WIDTH ||
+                ny >= (int16_t)MAZE_HEIGHT) {
+                continue;
+            }
+            index = (uint16_t)(ny * (int16_t)MAZE_WIDTH + nx);
+            if (visited[index] ||
+                maze_game_cell(game, (uint8_t)nx, (uint8_t)ny) !=
+                    MAZE_CELL_PATH) {
+                continue;
+            }
+            visited[index] = true;
+            queue[tail++] = (maze_point_t){(uint8_t)nx, (uint8_t)ny};
+        }
+    }
+    return false;
+}
+
+static void maze_make_corridor(maze_game_t *game)
+{
+    uint8_t x;
+
+    maze_game_init(game);
+    maze_game_set_mode(game, MAZE_MODE_CHALLENGE);
+    maze_game_seed(game, 7U);
+    maze_game_start(game);
+    memset(game->state.cells, MAZE_CELL_WALL, sizeof(game->state.cells));
+    for (x = 1U; x <= 10U; ++x) {
+        game->state.cells[(uint16_t)MAZE_WIDTH + x] = MAZE_CELL_PATH;
+    }
+    game->state.entrance = (maze_point_t){1U, 1U};
+    game->state.exit_cell = (maze_point_t){10U, 1U};
+    game->state.player = (maze_point_t){1U, 1U};
+    game->state.guard = (maze_point_t){4U, 1U};
+    game->state.guard_spawn = game->state.guard;
+    game->state.guard_dir = MAZE_DIR_LEFT;
+    game->state.guard_active = true;
+    game->state.paused = false;
+}
+
+/* 迷宫逻辑回归: 生成连通, 撞墙, 过关, 超时重来, 守卫视线. */
+static int selftest_maze_logic(void)
+{
+    int all = 1;
+    maze_game_t game;
+    const maze_state_t *state;
+    maze_event_t event;
+
+    maze_game_init(&game);
+    maze_game_seed(&game, 20260926U);
+    maze_game_set_mode(&game, MAZE_MODE_SIMPLE);
+    maze_game_start(&game);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_generated_connected",
+        state && maze_game_cell(&game, state->entrance.x, state->entrance.y) ==
+                     MAZE_CELL_PATH &&
+            maze_game_cell(&game, state->exit_cell.x, state->exit_cell.y) ==
+                MAZE_CELL_PATH &&
+            maze_can_reach_exit(&game));
+    all &= check_item("maze_simple_no_guard_no_timer",
+                      state && !state->guard_active && state->remain_ms == 0U &&
+                          state->guard.x == 0U && state->guard.y == 0U);
+    {
+        const int8_t dx[4] = {1, 0, -1, 0};
+        const int8_t dy[4] = {0, 1, 0, -1};
+        const maze_input_t step[4] = {
+            MAZE_INPUT_RIGHT, MAZE_INPUT_DOWN, MAZE_INPUT_LEFT, MAZE_INPUT_UP
+        };
+        maze_point_t old_player = state->player;
+        maze_point_t next = state->entrance;
+        maze_input_t go = MAZE_INPUT_RIGHT;
+        uint8_t i;
+        bool found = false;
+
+        for (i = 0U; i < 4U; ++i) {
+            int16_t nx = (int16_t)state->entrance.x + dx[i];
+            int16_t ny = (int16_t)state->entrance.y + dy[i];
+            if ((nx < 0) || (ny < 0) ||
+                maze_game_cell(&game, (uint8_t)nx, (uint8_t)ny) !=
+                    MAZE_CELL_PATH) {
+                continue;
+            }
+            next.x = (uint8_t)nx;
+            next.y = (uint8_t)ny;
+            go = step[i];
+            found = true;
+            break;
+        }
+        game.state.guard = next;
+        game.state.player = state->entrance;
+        event = found ? maze_game_set_input(&game, go) : MAZE_EVENT_NONE;
+        state = maze_game_state(&game);
+        all &= check_item(
+            "maze_simple_ignores_inactive_guard",
+            found && event == MAZE_EVENT_MOVED && state &&
+                !state->guard_active && state->caught_count == 0U &&
+                state->player.x == next.x && state->player.y == next.y);
+        game.state.player = old_player;
+        game.state.guard.x = 0U;
+        game.state.guard.y = 0U;
+    }
+
+    event = maze_game_set_input(&game, MAZE_INPUT_LEFT);
+    state = maze_game_state(&game);
+    all &= check_item("maze_wall_blocks_player",
+                      event == MAZE_EVENT_BLOCKED && state &&
+                          state->player.x == state->entrance.x &&
+                          state->player.y == state->entrance.y);
+
+    maze_game_init(&game);
+    maze_game_set_mode(&game, MAZE_MODE_TIMED);
+    maze_game_seed(&game, 11U);
+    maze_game_start(&game);
+    {
+        const int8_t dx[4] = {0, 0, -1, 1};
+        const int8_t dy[4] = {-1, 1, 0, 0};
+        const maze_input_t step[4] = {
+            MAZE_INPUT_DOWN, MAZE_INPUT_UP, MAZE_INPUT_RIGHT, MAZE_INPUT_LEFT
+        };
+        uint8_t i;
+        event = MAZE_EVENT_NONE;
+        state = maze_game_state(&game);
+        for (i = 0U; state && i < 4U; ++i) {
+            int16_t nx = (int16_t)state->exit_cell.x + dx[i];
+            int16_t ny = (int16_t)state->exit_cell.y + dy[i];
+            if (nx < 0 || ny < 0 || maze_game_cell(&game, (uint8_t)nx,
+                                                   (uint8_t)ny) !=
+                                        MAZE_CELL_PATH) {
+                continue;
+            }
+            game.state.player.x = (uint8_t)nx;
+            game.state.player.y = (uint8_t)ny;
+            event = maze_game_set_input(&game, step[i]);
+            break;
+        }
+    }
+    state = maze_game_state(&game);
+    all &= check_item("maze_exit_next_level",
+                      event == MAZE_EVENT_LEVEL_CLEAR && state &&
+                          state->level == 2U &&
+                          maze_can_reach_exit(&game));
+
+    maze_game_init(&game);
+    maze_game_set_mode(&game, MAZE_MODE_TIMED);
+    maze_game_seed(&game, 13U);
+    maze_game_start(&game);
+    state = maze_game_state(&game);
+    {
+        maze_point_t old_exit = state->exit_cell;
+        uint8_t old_wall = maze_game_cell(&game, 0U, 0U);
+        (void)maze_game_set_input(&game, MAZE_INPUT_RIGHT);
+        event = maze_game_advance(&game, MAZE_TIMED_LIMIT_MS);
+        state = maze_game_state(&game);
+        all &= check_item(
+            "maze_timeout_retries_same_level",
+            event == MAZE_EVENT_TIMEOUT && state && state->level == 1U &&
+                state->timeout_count == 1U &&
+                maze_game_same_point(state->player, state->entrance) &&
+                maze_game_same_point(state->exit_cell, old_exit) &&
+                maze_game_cell(&game, 0U, 0U) == old_wall &&
+                state->remain_ms == MAZE_TIMED_LIMIT_MS);
+    }
+
+    maze_game_init(&game);
+    maze_game_set_mode(&game, MAZE_MODE_CHALLENGE);
+    maze_game_seed(&game, 20260926U);
+    maze_game_start(&game);
+    state = maze_game_state(&game);
+    all &= check_item("maze_challenge_no_timer",
+                      state && state->guard_active && state->remain_ms == 0U);
+    all &= check_item(
+        "maze_challenge_spawn_split",
+        state && maze_game_same_point(state->player, state->entrance) &&
+            maze_game_same_point(state->guard, state->exit_cell) &&
+            maze_game_same_point(state->guard_spawn, state->exit_cell) &&
+            !maze_game_same_point(state->player, state->guard));
+    event = maze_game_advance(&game, MAZE_GUARD_STEP_MS);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_challenge_guard_leaves_exit",
+        event != MAZE_EVENT_CAUGHT && state &&
+            maze_game_same_point(state->player, state->entrance) &&
+            !maze_game_same_point(state->guard, state->exit_cell) &&
+            maze_game_cell(&game, state->guard.x, state->guard.y) ==
+                MAZE_CELL_PATH);
+    {
+        maze_point_t prev;
+        uint8_t i;
+        int stays_away = 1;
+
+        prev = state->guard;
+        for (i = 0U; i < 5U; ++i) {
+            event = maze_game_advance(&game, MAZE_GUARD_STEP_MS);
+            state = maze_game_state(&game);
+            if (!state || (event == MAZE_EVENT_CAUGHT) ||
+                maze_game_same_point(state->guard, state->exit_cell) ||
+                maze_game_same_point(state->guard, prev)) {
+                stays_away = 0;
+            }
+            if (state) {
+                prev = state->guard;
+            }
+        }
+        all &= check_item("maze_challenge_guard_keeps_leaving_exit",
+                          stays_away != 0);
+    }
+
+    maze_make_corridor(&game);
+    game.state.player = (maze_point_t){0U, 0U};
+    game.state.guard = game.state.exit_cell;
+    game.state.guard_spawn = game.state.exit_cell;
+    game.state.guard_dir = MAZE_DIR_LEFT;
+    {
+        uint8_t expect_x;
+        int patrol_ok = 1;
+
+        for (expect_x = 9U; expect_x >= 4U; --expect_x) {
+            event = maze_game_advance(&game, MAZE_GUARD_STEP_MS);
+            state = maze_game_state(&game);
+            if (!state || (event == MAZE_EVENT_CAUGHT) ||
+                (state->guard.x != expect_x) || (state->guard.y != 1U) ||
+                maze_game_same_point(state->guard, state->exit_cell) ||
+                (state->guard.x <=
+                 (uint8_t)(game.state.entrance.x + MAZE_ENTRANCE_SAFE_DIST))) {
+                patrol_ok = 0;
+                break;
+            }
+        }
+        if (patrol_ok) {
+            event = maze_game_advance(&game, MAZE_GUARD_STEP_MS);
+            state = maze_game_state(&game);
+            if (!state || (state->guard.x != 5U) || (state->guard.y != 1U)) {
+                patrol_ok = 0;
+            }
+        }
+        all &= check_item("maze_guard_patrols_corridor_no_oscillate",
+                          patrol_ok != 0);
+    }
+
+    maze_make_corridor(&game);
+    game.state.player = game.state.entrance;
+    game.state.guard = (maze_point_t){4U, 1U};
+    game.state.guard_dir = MAZE_DIR_LEFT;
+    event = maze_game_advance(&game, MAZE_GUARD_STEP_MS);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_guard_turns_before_entrance_safe",
+        event != MAZE_EVENT_CAUGHT && state &&
+            maze_game_same_point(state->player, state->entrance) &&
+            (state->guard.x == 5U) && (state->guard.y == 1U));
+    game.state.guard = (maze_point_t){3U, 1U};
+    game.state.guard_dir = MAZE_DIR_LEFT;
+    event = maze_game_set_input(&game, MAZE_INPUT_RIGHT);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_entrance_safe_no_catch",
+        event == MAZE_EVENT_MOVED && state &&
+            (state->player.x == 2U) && (state->player.y == 1U) &&
+            (state->caught_count == 0U));
+
+    maze_make_corridor(&game);
+    game.state.guard = (maze_point_t){8U, 1U};
+    game.state.guard_dir = MAZE_DIR_LEFT;
+    all &= check_item("maze_sight_two_cells",
+                      maze_game_is_sight_cell(&game, 7U, 1U) &&
+                          maze_game_is_sight_cell(&game, 6U, 1U) &&
+                          !maze_game_is_sight_cell(&game, 5U, 1U) &&
+                          !maze_game_is_sight_cell(&game, 1U, 1U));
+    game.state.player = (maze_point_t){5U, 1U};
+    event = maze_game_set_input(&game, MAZE_INPUT_RIGHT);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_seen_returns_to_entrance",
+        event == MAZE_EVENT_CAUGHT && state &&
+            maze_game_same_point(state->player, state->entrance) &&
+            maze_game_same_point(state->guard, state->guard_spawn) &&
+            state->caught_count == 1U);
+
+    maze_make_corridor(&game);
+    game.state.guard = (maze_point_t){8U, 1U};
+    game.state.guard_dir = MAZE_DIR_LEFT;
+    game.state.cells[(uint16_t)MAZE_WIDTH + 7U] = MAZE_CELL_WALL;
+    all &= check_item("maze_wall_blocks_sight",
+                      maze_game_is_sight_cell(&game, 7U, 1U) == false &&
+                          maze_game_is_sight_cell(&game, 6U, 1U) == false);
+
+    maze_make_corridor(&game);
+    game.state.player = (maze_point_t){5U, 1U};
+    game.state.guard = (maze_point_t){6U, 1U};
+    event = maze_game_set_input(&game, MAZE_INPUT_RIGHT);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_catch_resets_guard_to_exit_spawn",
+        event == MAZE_EVENT_CAUGHT && state &&
+            maze_game_same_point(state->player, state->entrance) &&
+            maze_game_same_point(state->guard, state->guard_spawn) &&
+            maze_game_same_point(state->guard_spawn, (maze_point_t){4U, 1U}));
+
+    maze_make_corridor(&game);
+    game.state.player = (maze_point_t){9U, 1U};
+    game.state.guard = (maze_point_t){4U, 1U};
+    game.state.guard_dir = MAZE_DIR_LEFT;
+    event = maze_game_set_input(&game, MAZE_INPUT_RIGHT);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_exit_clears_even_with_guard",
+        event == MAZE_EVENT_LEVEL_CLEAR && state && state->level == 2U);
+    return all ? 0 : 1;
+}
+
+/**
+ * @brief 生成模块: 关卡表递增, 高低关都能连通.
+ *
+ * @return 0 通过, 1 失败.
+ */
+static int selftest_maze_gen(void)
+{
+    int all = 1;
+    maze_gen_map_t map;
+    uint8_t cells[MAZE_CELL_COUNT];
+    maze_gen_metrics_t metrics;
+    const maze_gen_diff_t *diff1 = maze_gen_diff_spec(1U);
+    const maze_gen_diff_t *diff10 = maze_gen_diff_spec(10U);
+    uint32_t rng;
+    maze_game_t game;
+    const maze_state_t *state;
+
+    all &= check_item(
+        "maze_gen_level_maps_diff",
+        (maze_gen_difficulty_of_level(1U) == 1U) &&
+            (maze_gen_difficulty_of_level(3U) == 1U) &&
+            (maze_gen_difficulty_of_level(4U) == 2U) &&
+            (maze_gen_difficulty_of_level(30U) == 10U) &&
+            (maze_gen_difficulty_of_level(99U) == 10U) &&
+            diff1 && diff10 &&
+            (diff1->target_path > 0U) && (diff10->target_path == 0U));
+
+    map.width = (uint8_t)MAZE_WIDTH;
+    map.height = (uint8_t)MAZE_HEIGHT;
+    map.cells = cells;
+    rng = 20260926U;
+    all &= check_item("maze_gen_level1_create",
+                      maze_gen_create(&map, 1U, &rng) &&
+                          maze_gen_measure(&map, &metrics) &&
+                          (metrics.path_len > 0U) &&
+                          (metrics.path_len <= 36U) &&
+                          !maze_game_same_point(map.entrance, map.exit_cell));
+
+    rng = 20260927U;
+    all &= check_item("maze_gen_level4_create",
+                      maze_gen_create(&map, 4U, &rng) &&
+                          maze_gen_measure(&map, &metrics) &&
+                          (metrics.path_len > 0U) &&
+                          (metrics.branches > 0U));
+
+    maze_game_init(&game);
+    maze_game_seed(&game, 77U);
+    maze_game_start(&game);
+    state = maze_game_state(&game);
+    all &= check_item(
+        "maze_gen_logic_uses_level",
+        state && (state->level == 1U) && maze_can_reach_exit(&game) &&
+            (state->remain_ms == 0U) && !state->guard_active);
+    return all ? 0 : 1;
+}
+
+static int maze_cell_is_path(const maze_state_t *state, int x, int y)
+{
+    if (!state || (x < 0) || (y < 0) || (x >= (int)state->width) ||
+        (y >= (int)state->height)) {
+        return 0;
+    }
+    return state->cells[((size_t)y * state->width) + (size_t)x] ==
+           MAZE_CELL_PATH;
+}
+
+/**
+ * @brief 一次界面循环里灌入多发连按, 确认玩家只走一格.
+ *
+ * @return 0 通过, 1 失败.
+ */
+static int selftest_maze_hold(void)
+{
+    static const int dirs[4][3] = {
+        {0, -1, 2},
+        {0, 1, 3},
+        {-1, 0, 1},
+        {1, 0, 4},
+    };
+    const maze_state_t *state;
+    maze_point_t pos;
+    int all = 1;
+    int dir;
+    int steps;
+    int i;
+    uint8_t key = 0U;
+
+    maze_ui_set_shot_seed(20260926U);
+    maze_ui_set_theme(MAZE_UI_THEME_DESERT);
+    maze_ui_enter_menu();
+    maze_ui_handle_key(5U, AD_KEYS_EVENT_PRESS);
+    maze_ui_render(NULL);
+    pump_lvgl();
+    state = maze_ui_state();
+    if (!state) {
+        return check_item("maze_hold_state", 0) ? 0 : 1;
+    }
+    pos = state->player;
+    for (dir = 0; dir < 4; ++dir) {
+        if (maze_cell_is_path(state, (int)pos.x + dirs[dir][0],
+                              (int)pos.y + dirs[dir][1])) {
+            key = (uint8_t)dirs[dir][2];
+            break;
+        }
+    }
+    all &= check_item("maze_hold_open_dir", key != 0U);
+    if (!key) {
+        return 1;
+    }
+    for (i = 0; i < 6; ++i) {
+        maze_ui_handle_key(key, AD_KEYS_EVENT_REPEAT);
+    }
+    maze_ui_advance(20U);
+    state = maze_ui_state();
+    steps = 0;
+    if (state) {
+        steps = abs((int)state->player.x - (int)pos.x) +
+                abs((int)state->player.y - (int)pos.y);
+    }
+    all &= check_item("maze_hold_one_cell", steps == 1);
+    return all ? 0 : 1;
+}
+
 static int selftest_ui(void)
 {
     int all = 1;
@@ -619,6 +1125,14 @@ static int selftest_ui(void)
     state = game_ui_get_state();
     all &= check_item("eat_food_score", state && state->score == 10);
 
+    inject_token("K5");
+    inject_token("DOWN");
+    inject_token("K5");
+    state = game_ui_get_state();
+    all &= check_item("pause_restart",
+                      state && !state->paused && !state->game_over &&
+                          state->score == 0 && state->foods_eaten == 0U);
+
     game_ui_force_self_collision();
     advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     state = game_ui_get_state();
@@ -633,6 +1147,29 @@ static int selftest_ui(void)
     advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     inject_token("K5");
     all &= check_item("end_to_menu", 1);
+
+    game_ui_set_touch_control(true);
+    all &= check_item("touch_on", game_ui_get_touch_control());
+    all &= check_item(
+        "touch_horizontal_top",
+        game_ui_map_touch(240, 40) == SNAKE_INPUT_UP);
+    all &= check_item(
+        "touch_horizontal_bottom",
+        game_ui_map_touch(240, 240) == SNAKE_INPUT_DOWN);
+    inject_token("K2");
+    advance_ms(game_ui_get_state() ? game_ui_get_state()->speed_ms
+                                   : SNAKE_SPEED_SLOW_MS);
+    all &= check_item(
+        "touch_vertical_left",
+        game_ui_map_touch(80, 160) == SNAKE_INPUT_LEFT);
+    all &= check_item(
+        "touch_vertical_right",
+        game_ui_map_touch(400, 160) == SNAKE_INPUT_RIGHT);
+    game_ui_set_touch_control(false);
+    maze_ui_set_theme(MAZE_UI_THEME_SNOW);
+    all &= check_item("maze_theme_set",
+                      maze_ui_get_theme() == MAZE_UI_THEME_SNOW);
+    maze_ui_set_theme(MAZE_UI_THEME_DESERT);
     return all ? 0 : 1;
 }
 
@@ -640,21 +1177,48 @@ static int run_scene(const char *scene, const char *keys, int steps,
                      uint32_t advance_step_ms)
 {
     if (scene && !strcmp(scene, "game")) {
-        inject_token("START");
+        enter_snake_game();
     } else if (scene && !strcmp(scene, "head_right")) {
-        inject_token("START");
+        enter_snake_game();
     } else if (scene && !strcmp(scene, "head_up")) {
-        inject_token("START");
+        enter_snake_game();
         inject_token("K2");
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
+    } else if (scene && !strcmp(scene, "snake_menu")) {
+        inject_token("K5");
+    } else if (scene && !strcmp(scene, "maze_menu")) {
+        inject_token("DOWN");
+        inject_token("K5");
+    } else if (scene && !strcmp(scene, "maze")) {
+        enter_maze_theme(MAZE_UI_THEME_DESERT);
+    } else if (scene && !strcmp(scene, "maze_desert")) {
+        enter_maze_theme(MAZE_UI_THEME_DESERT);
+    } else if (scene && !strcmp(scene, "maze_snow")) {
+        enter_maze_theme(MAZE_UI_THEME_SNOW);
+    } else if (scene && !strcmp(scene, "maze_forest")) {
+        enter_maze_theme(MAZE_UI_THEME_FOREST);
+    } else if (scene && !strcmp(scene, "maze_space")) {
+        enter_maze_theme(MAZE_UI_THEME_SPACE);
+    } else if (scene && !strcmp(scene, "maze_ocean")) {
+        enter_maze_theme(MAZE_UI_THEME_OCEAN);
+    } else if (scene && !strcmp(scene, "maze_actor_desert")) {
+        enter_maze_challenge_theme(MAZE_UI_THEME_DESERT);
+    } else if (scene && !strcmp(scene, "maze_actor_snow")) {
+        enter_maze_challenge_theme(MAZE_UI_THEME_SNOW);
+    } else if (scene && !strcmp(scene, "maze_actor_forest")) {
+        enter_maze_challenge_theme(MAZE_UI_THEME_FOREST);
+    } else if (scene && !strcmp(scene, "maze_actor_space")) {
+        enter_maze_challenge_theme(MAZE_UI_THEME_SPACE);
+    } else if (scene && !strcmp(scene, "maze_actor_ocean")) {
+        enter_maze_challenge_theme(MAZE_UI_THEME_OCEAN);
     } else if (scene && !strcmp(scene, "head_down")) {
-        inject_token("START");
+        enter_snake_game();
         inject_token("K3");
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     } else if (scene && !strcmp(scene, "head_left")) {
-        inject_token("START");
+        enter_snake_game();
         inject_token("K2");
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
@@ -662,7 +1226,7 @@ static int run_scene(const char *scene, const char *keys, int steps,
         state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
     } else if (scene && !strcmp(scene, "ate")) {
-        inject_token("START");
+        enter_snake_game();
         const snake_state_t *state = game_ui_get_state();
         snake_point_t food = state->segments[0];
         food.x = (uint8_t)(food.x + 1U);
@@ -671,10 +1235,10 @@ static int run_scene(const char *scene, const char *keys, int steps,
         }
         advance_ms(state->speed_ms);
     } else if (scene && !strcmp(scene, "paused")) {
-        inject_token("START");
+        enter_snake_game();
         inject_token("K5");
     } else if (scene && !strcmp(scene, "end")) {
-        inject_token("START");
+        enter_snake_game();
         game_ui_force_self_collision();
         const snake_state_t *state = game_ui_get_state();
         advance_ms(state ? state->speed_ms : SNAKE_SPEED_SLOW_MS);
@@ -739,9 +1303,13 @@ int main(int argc, char **argv)
     int rc;
     if (self) {
         int logic_rc = selftest_logic();
+        int maze_rc = selftest_maze_logic();
+        int maze_gen_rc = selftest_maze_gen();
         int shot_rc = selftest_shot();
         int ui_rc = selftest_ui();
-        rc = logic_rc || shot_rc || ui_rc;
+        int hold_rc = selftest_maze_hold();
+        rc = logic_rc || maze_rc || maze_gen_rc || shot_rc || ui_rc ||
+             hold_rc;
     } else {
         rc = run_scene(scene, keys, steps, advance_step_ms);
     }
